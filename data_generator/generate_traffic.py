@@ -22,21 +22,17 @@ PAUSE_BETWEEN_BURSTS = 60  # seconds
 
 
 def get_image_paths(dataset_dir):
+    """Get image paths from the evaluation set only — simulates unseen production data."""
     paths = []
-    for split in ["training", "validation", "evaluation"]:
-        split_dir = os.path.join(dataset_dir, split)
-        if not os.path.isdir(split_dir):
-            continue
-        paths.extend(glob.glob(os.path.join(split_dir, "**", "*.jpg"), recursive=True))
+    eval_dir = os.path.join(dataset_dir, "evaluation")
+    if os.path.isdir(eval_dir):
+        paths.extend(glob.glob(os.path.join(eval_dir, "**", "*.jpg"), recursive=True))
     if not paths:
-        # try flat structure (images directly in split dirs)
-        for split in ["training", "validation", "evaluation"]:
-            split_dir = os.path.join(dataset_dir, split)
-            if not os.path.isdir(split_dir):
-                continue
-            for f in os.listdir(split_dir):
+        # try flat structure (images directly in eval dir)
+        if os.path.isdir(eval_dir):
+            for f in os.listdir(eval_dir):
                 if f.lower().endswith((".jpg", ".jpeg", ".png")):
-                    paths.append(os.path.join(split_dir, f))
+                    paths.append(os.path.join(eval_dir, f))
     return paths
 
 
