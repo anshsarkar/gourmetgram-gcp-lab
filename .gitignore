@@ -73,7 +73,9 @@ db.sqlite3
 db.sqlite3-journal
 
 # Flask stuff:
-instance/
+# NOTE: instance/ is NOT ignored because gourmetgram/instance/uploads/test_image.jpeg
+# is needed for the /test health probe endpoint
+# instance/
 .webassets-cache
 
 # Scrapy stuff:
