@@ -3,6 +3,17 @@ __pycache__/
 *.py[codz]
 *$py.class
 
+# macOS
+.DS_Store
+
+# Claude Code AI memory/context (not project deliverables)
+docs/ai/
+
+# Claude Code symlink to docs/ai/CLAUDE.md
+CLAUDE.md
+
+# Internal proposal/planning docs
+proposal-managed-services.md
 # C extensions
 *.so
 
@@ -205,15 +216,3 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
-
-# macOS
-.DS_Store
-
-# Claude Code AI memory/context (not project deliverables)
-docs/ai/
-
-# Claude Code symlink to docs/ai/CLAUDE.md
-CLAUDE.md
-
-# Internal proposal/planning docs
-proposal-managed-services.md
