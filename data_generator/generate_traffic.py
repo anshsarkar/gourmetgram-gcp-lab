@@ -6,6 +6,7 @@ import time
 import base64
 import uuid
 import argparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import requests
 
 SERVICE_URL = os.environ.get("SERVICE_URL", "").rstrip("/")
@@ -15,6 +16,8 @@ GCS_UPLOAD_BUCKET = os.environ.get("GCS_UPLOAD_BUCKET", "")
 # Burst config
 NUM_BURSTS = 3
 IMAGES_PER_BURST = 200
+FINAL_BURST_MULTIPLIER = 4  # last burst sends 4x images concurrently
+CONCURRENT_WORKERS = 20
 PAUSE_BETWEEN_BURSTS = 60  # seconds
 
 
@@ -43,13 +46,13 @@ def send_predict_request(image_path):
     resp = requests.post(
         f"{SERVICE_URL}/api/predict",
         json={"image": img_b64},
-        timeout=30,
+        timeout=60,
     )
     return resp.status_code, resp.json()
 
 
 def send_load_request():
-    resp = requests.get(f"{SERVICE_URL}/test", timeout=30)
+    resp = requests.get(f"{SERVICE_URL}/test", timeout=60)
     return resp.status_code, resp.text
 
 
@@ -61,6 +64,74 @@ def upload_to_gcs(image_path):
     blob = bucket.blob(f"uploads/{filename}")
     blob.upload_from_filename(image_path, content_type="image/jpeg")
     return filename
+
+
+def run_burst_sequential(mode, sample, burst_size):
+    errors = 0
+    for i in range(burst_size):
+        try:
+            if mode == "predict":
+                status, result = send_predict_request(sample[i])
+                if status == 200:
+                    print(f"  [{i+1}/{burst_size}] {os.path.basename(sample[i])} -> {result['prediction']} ({result['confidence']:.2f})")
+                else:
+                    print(f"  [{i+1}/{burst_size}] {os.path.basename(sample[i])} -> HTTP {status}")
+                    errors += 1
+            elif mode == "upload":
+                filename = upload_to_gcs(sample[i])
+                print(f"  [{i+1}/{burst_size}] {os.path.basename(sample[i])} -> gs://{GCS_UPLOAD_BUCKET}/uploads/{filename}")
+            else:
+                status, result = send_load_request()
+                if status == 200:
+                    print(f"  [{i+1}/{burst_size}] /test -> {result}")
+                else:
+                    print(f"  [{i+1}/{burst_size}] /test -> HTTP {status}")
+                    errors += 1
+        except Exception as e:
+            print(f"  [{i+1}/{burst_size}] ERROR: {e}")
+            errors += 1
+    return errors
+
+
+def run_burst_concurrent(mode, sample, burst_size):
+    errors = 0
+    completed = 0
+
+    def do_request(idx):
+        if mode == "predict":
+            return idx, send_predict_request(sample[idx])
+        elif mode == "upload":
+            return idx, (200, upload_to_gcs(sample[idx]))
+        else:
+            return idx, send_load_request()
+
+    with ThreadPoolExecutor(max_workers=CONCURRENT_WORKERS) as executor:
+        futures = {executor.submit(do_request, i): i for i in range(burst_size)}
+        for future in as_completed(futures):
+            completed += 1
+            try:
+                idx, result = future.result()
+                if mode == "predict":
+                    status, data = result
+                    if status == 200:
+                        print(f"  [{completed}/{burst_size}] {os.path.basename(sample[idx])} -> {data['prediction']} ({data['confidence']:.2f})")
+                    else:
+                        print(f"  [{completed}/{burst_size}] {os.path.basename(sample[idx])} -> HTTP {status}")
+                        errors += 1
+                elif mode == "upload":
+                    _, filename = result
+                    print(f"  [{completed}/{burst_size}] {os.path.basename(sample[idx])} -> uploaded")
+                else:
+                    status, data = result
+                    if status == 200:
+                        print(f"  [{completed}/{burst_size}] /test -> {data}")
+                    else:
+                        print(f"  [{completed}/{burst_size}] /test -> HTTP {status}")
+                        errors += 1
+            except Exception as e:
+                print(f"  [{completed}/{burst_size}] ERROR: {e}")
+                errors += 1
+    return errors
 
 
 def main():
@@ -89,52 +160,46 @@ def main():
             sys.exit(1)
         print(f"Found {len(image_paths)} images in {DATASET_DIR}")
 
+    final_burst_size = IMAGES_PER_BURST * FINAL_BURST_MULTIPLIER
+    total_requests = IMAGES_PER_BURST * (NUM_BURSTS - 1) + final_burst_size
+
     print(f"Mode: {args.mode}")
     if args.mode == "upload":
         print(f"Target bucket: gs://{GCS_UPLOAD_BUCKET}/uploads/")
     else:
         print(f"Target: {SERVICE_URL}")
-    print(f"Plan: {NUM_BURSTS} bursts x {IMAGES_PER_BURST} requests, {PAUSE_BETWEEN_BURSTS}s pause between bursts")
+    print(f"Plan: {NUM_BURSTS - 1} bursts x {IMAGES_PER_BURST} sequential, "
+          f"then 1 burst x {final_burst_size} concurrent ({CONCURRENT_WORKERS} workers)")
+    print(f"Total: {total_requests} requests, {PAUSE_BETWEEN_BURSTS}s pause between bursts")
     print()
 
     total_sent = 0
     total_errors = 0
 
     for burst in range(NUM_BURSTS):
-        print(f"--- Burst {burst + 1}/{NUM_BURSTS} ---")
-        burst_errors = 0
+        is_final = (burst == NUM_BURSTS - 1)
+        burst_size = final_burst_size if is_final else IMAGES_PER_BURST
+
+        if is_final:
+            print(f"--- Burst {burst + 1}/{NUM_BURSTS} (FINAL — {burst_size} concurrent requests) ---")
+        else:
+            print(f"--- Burst {burst + 1}/{NUM_BURSTS} ---")
+
         burst_start = time.time()
 
+        sample = None
         if args.mode in ("predict", "upload"):
-            sample = random.choices(image_paths, k=IMAGES_PER_BURST)
+            sample = random.choices(image_paths, k=burst_size)
 
-        for i in range(IMAGES_PER_BURST):
-            try:
-                if args.mode == "predict":
-                    status, result = send_predict_request(sample[i])
-                    if status == 200:
-                        print(f"  [{i+1}/{IMAGES_PER_BURST}] {os.path.basename(sample[i])} -> {result['prediction']} ({result['confidence']:.2f})")
-                    else:
-                        print(f"  [{i+1}/{IMAGES_PER_BURST}] {os.path.basename(sample[i])} -> HTTP {status}")
-                        burst_errors += 1
-                elif args.mode == "upload":
-                    filename = upload_to_gcs(sample[i])
-                    print(f"  [{i+1}/{IMAGES_PER_BURST}] {os.path.basename(sample[i])} -> gs://{GCS_UPLOAD_BUCKET}/uploads/{filename}")
-                else:
-                    status, result = send_load_request()
-                    if status == 200:
-                        print(f"  [{i+1}/{IMAGES_PER_BURST}] /test -> {result}")
-                    else:
-                        print(f"  [{i+1}/{IMAGES_PER_BURST}] /test -> HTTP {status}")
-                        burst_errors += 1
-            except Exception as e:
-                print(f"  [{i+1}/{IMAGES_PER_BURST}] ERROR: {e}")
-                burst_errors += 1
+        if is_final:
+            burst_errors = run_burst_concurrent(args.mode, sample, burst_size)
+        else:
+            burst_errors = run_burst_sequential(args.mode, sample, burst_size)
 
         elapsed = time.time() - burst_start
-        total_sent += IMAGES_PER_BURST
+        total_sent += burst_size
         total_errors += burst_errors
-        print(f"  Burst done: {IMAGES_PER_BURST - burst_errors}/{IMAGES_PER_BURST} OK in {elapsed:.1f}s")
+        print(f"  Burst done: {burst_size - burst_errors}/{burst_size} OK in {elapsed:.1f}s")
 
         if burst < NUM_BURSTS - 1:
             print(f"  Pausing {PAUSE_BETWEEN_BURSTS}s...")
