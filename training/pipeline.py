@@ -478,8 +478,8 @@ if __name__ == "__main__":
     parser.add_argument("--training-bucket", required=True)
     parser.add_argument("--pipeline-root", required=True,
                         help="GCS path for pipeline artifacts, e.g. gs://bucket/pipeline-artifacts")
-    parser.add_argument("--initial-epochs", type=int, default=5)
-    parser.add_argument("--total-epochs", type=int, default=20)
+    parser.add_argument("--initial-epochs", type=int, default=1)
+    parser.add_argument("--total-epochs", type=int, default=1)
     parser.add_argument("--patience", type=int, default=5)
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--lr", type=float, default=1e-4)
