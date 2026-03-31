@@ -20,107 +20,116 @@ def prepare_data(
     import json
     import logging
     import random
+    import traceback
     from google.cloud import storage
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
     logger = logging.getLogger(__name__)
 
-    client = storage.Client()
-    bucket = client.bucket(training_bucket)
+    try:
+        logger.info(f"=== prepare_data started. Bucket: {training_bucket} ===")
 
-    # Read training metadata to find last trained version
-    metadata_blob = bucket.blob("training_metadata.json")
-    if metadata_blob.exists():
-        metadata = json.loads(metadata_blob.download_as_text())
-        last_trained = metadata.get("last_trained_version", 0)
-        logger.info(f"Found training metadata. Last trained version: v{last_trained}")
-    else:
-        metadata = {}
-        last_trained = 0
-        logger.info("No training metadata found. Will process all versions.")
+        client = storage.Client()
+        bucket = client.bucket(training_bucket)
 
-    # Find all dataset versions
-    blobs = bucket.list_blobs(prefix="datasets/Food-11/v", delimiter="/")
-    list(blobs)
-    versions = []
-    for prefix in blobs.prefixes:
-        folder_name = prefix.rstrip("/").split("/")[-1]
-        if folder_name.startswith("v") and folder_name[1:].isdigit():
-            v = int(folder_name[1:])
-            if v > last_trained:
-                versions.append(v)
+        # Read training metadata to find last trained version
+        metadata_blob = bucket.blob("training_metadata.json")
+        if metadata_blob.exists():
+            metadata = json.loads(metadata_blob.download_as_text())
+            last_trained = metadata.get("last_trained_version", 0)
+            logger.info(f"Found training metadata. Last trained version: v{last_trained}")
+        else:
+            metadata = {}
+            last_trained = 0
+            logger.info("No training metadata found. Will process all versions.")
 
-    if not versions:
-        logger.info("No new versions to process. Exiting.")
-        collated_dataset.metadata["versions_collated"] = []
-        collated_dataset.metadata["total_images"] = 0
-        return
+        # Find all dataset versions
+        blobs = bucket.list_blobs(prefix="datasets/Food-11/v", delimiter="/")
+        list(blobs)
+        versions = []
+        for prefix in blobs.prefixes:
+            folder_name = prefix.rstrip("/").split("/")[-1]
+            if folder_name.startswith("v") and folder_name[1:].isdigit():
+                v = int(folder_name[1:])
+                if v > last_trained:
+                    versions.append(v)
 
-    versions.sort()
-    logger.info(f"Versions to collate: {['v' + str(v) for v in versions]}")
+        if not versions:
+            logger.info("No new versions to process. Exiting.")
+            collated_dataset.metadata["versions_collated"] = []
+            collated_dataset.metadata["total_images"] = 0
+            return
 
-    # Collect all image blobs from untrained versions
-    all_image_blobs = []
-    for v in versions:
-        prefix = f"datasets/Food-11/v{v}/training/"
-        version_blobs = list(bucket.list_blobs(prefix=prefix))
-        images = [b for b in version_blobs if b.name.lower().endswith((".jpg", ".jpeg", ".png"))]
-        logger.info(f"  v{v}: {len(images)} images")
-        all_image_blobs.append((v, images))
+        versions.sort()
+        logger.info(f"Versions to collate: {['v' + str(v) for v in versions]}")
 
-    total_images = sum(len(imgs) for _, imgs in all_image_blobs)
-    logger.info(f"Total images to collate: {total_images}")
+        # Collect all image blobs from untrained versions
+        all_image_blobs = []
+        for v in versions:
+            prefix = f"datasets/Food-11/v{v}/training/"
+            version_blobs = list(bucket.list_blobs(prefix=prefix))
+            images = [b for b in version_blobs if b.name.lower().endswith((".jpg", ".jpeg", ".png"))]
+            logger.info(f"  v{v}: {len(images)} images")
+            all_image_blobs.append((v, images))
 
-    # Flatten and shuffle for splitting
-    all_blobs_with_class = []
-    for v, images in all_image_blobs:
-        for blob in images:
-            # blob.name: datasets/Food-11/v1/training/class_03/abc.jpg
-            parts = blob.name.split("/")
-            class_dir = parts[-2]  # class_03
-            filename = parts[-1]   # abc.jpg
-            all_blobs_with_class.append((blob, class_dir, f"v{v}_{filename}"))
+        total_images = sum(len(imgs) for _, imgs in all_image_blobs)
+        logger.info(f"Total images to collate: {total_images}")
 
-    random.seed(42)
-    random.shuffle(all_blobs_with_class)
+        # Flatten and shuffle for splitting
+        all_blobs_with_class = []
+        for v, images in all_image_blobs:
+            for blob in images:
+                # blob.name: datasets/Food-11/v1/training/class_03/abc.jpg
+                parts = blob.name.split("/")
+                class_dir = parts[-2]  # class_03
+                filename = parts[-1]   # abc.jpg
+                all_blobs_with_class.append((blob, class_dir, f"v{v}_{filename}"))
 
-    # 80/20 train/val split
-    split_idx = int(len(all_blobs_with_class) * 0.8)
-    train_set = all_blobs_with_class[:split_idx]
-    val_set = all_blobs_with_class[split_idx:]
-    logger.info(f"Split: {len(train_set)} training, {len(val_set)} validation")
+        random.seed(42)
+        random.shuffle(all_blobs_with_class)
 
-    # Copy to collated/ directory
-    collated_prefix = "collated"
+        # 80/20 train/val split
+        split_idx = int(len(all_blobs_with_class) * 0.8)
+        train_set = all_blobs_with_class[:split_idx]
+        val_set = all_blobs_with_class[split_idx:]
+        logger.info(f"Split: {len(train_set)} training, {len(val_set)} validation")
 
-    # Clear any previous collated data
-    old_blobs = list(bucket.list_blobs(prefix=f"{collated_prefix}/"))
-    if old_blobs:
-        logger.info(f"Clearing {len(old_blobs)} old collated files...")
-        for b in old_blobs:
-            b.delete()
+        # Copy to collated/ directory
+        collated_prefix = "collated"
 
-    def copy_set(blob_set, split_name):
-        for i, (blob, class_dir, filename) in enumerate(blob_set):
-            dest_path = f"{collated_prefix}/{split_name}/{class_dir}/{filename}"
-            bucket.copy_blob(blob, bucket, new_name=dest_path)
-            if (i + 1) % 50 == 0:
-                logger.info(f"  {split_name}: copied {i + 1}/{len(blob_set)}")
+        # Clear any previous collated data
+        old_blobs = list(bucket.list_blobs(prefix=f"{collated_prefix}/"))
+        if old_blobs:
+            logger.info(f"Clearing {len(old_blobs)} old collated files...")
+            for b in old_blobs:
+                b.delete()
 
-    logger.info("Copying training set...")
-    copy_set(train_set, "training")
-    logger.info("Copying validation set...")
-    copy_set(val_set, "validation")
+        def copy_set(blob_set, split_name):
+            for i, (blob, class_dir, filename) in enumerate(blob_set):
+                dest_path = f"{collated_prefix}/{split_name}/{class_dir}/{filename}"
+                bucket.copy_blob(blob, bucket, new_name=dest_path)
+                if (i + 1) % 50 == 0:
+                    logger.info(f"  {split_name}: copied {i + 1}/{len(blob_set)}")
 
-    # Store metadata for the pipeline
-    collated_dataset.metadata["versions_collated"] = versions
-    collated_dataset.metadata["total_images"] = total_images
-    collated_dataset.metadata["train_count"] = len(train_set)
-    collated_dataset.metadata["val_count"] = len(val_set)
-    collated_dataset.metadata["gcs_path"] = f"gs://{training_bucket}/{collated_prefix}"
-    collated_dataset.uri = f"gs://{training_bucket}/{collated_prefix}"
+        logger.info("Copying training set...")
+        copy_set(train_set, "training")
+        logger.info("Copying validation set...")
+        copy_set(val_set, "validation")
 
-    logger.info(f"Data preparation complete. Collated at gs://{training_bucket}/{collated_prefix}")
+        # Store metadata for the pipeline
+        collated_dataset.metadata["versions_collated"] = versions
+        collated_dataset.metadata["total_images"] = total_images
+        collated_dataset.metadata["train_count"] = len(train_set)
+        collated_dataset.metadata["val_count"] = len(val_set)
+        collated_dataset.metadata["gcs_path"] = f"gs://{training_bucket}/{collated_prefix}"
+        collated_dataset.uri = f"gs://{training_bucket}/{collated_prefix}"
+
+        logger.info(f"Data preparation complete. Collated at gs://{training_bucket}/{collated_prefix}")
+
+    except Exception as e:
+        logger.error(f"prepare_data FAILED: {e}")
+        logger.error(traceback.format_exc())
+        raise
 
 
 # ---------------------------------------------------------------------------
