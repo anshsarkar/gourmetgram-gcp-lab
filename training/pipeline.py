@@ -415,7 +415,7 @@ def gourmetgram_training_pipeline(
         fine_tune_lr=fine_tune_lr,
     )
     train_task.set_accelerator_type("NVIDIA_TESLA_T4")
-    train_task.set_accelerator_count(1)
+    train_task.set_accelerator_limit(1)
 
 
 # ---------------------------------------------------------------------------
