@@ -137,7 +137,8 @@ def prepare_data(
 # Component 2: Train Model
 # ---------------------------------------------------------------------------
 @dsl.component(
-    base_image="TRAINING_IMAGE_PLACEHOLDER",
+    base_image="us-docker.pkg.dev/vertex-ai/training/pytorch-gpu.2-4:latest",
+    packages_to_install=["google-cloud-storage"],
 )
 def train_model(
     training_bucket: str,
@@ -209,7 +210,7 @@ def train_model(
         logger.info(f"Using device: {device}")
         if device.type == "cuda":
             logger.info(f"GPU: {torch.cuda.get_device_name(0)}")
-            logger.info(f"GPU memory: {torch.cuda.get_device_properties(0).total_mem / 1e9:.1f} GB")
+            logger.info(f"GPU memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
 
         # Data transforms
         train_transform = transforms.Compose([
@@ -494,24 +495,16 @@ if __name__ == "__main__":
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--fine-tune-lr", type=float, default=1e-5)
-    parser.add_argument("--training-image", required=True,
-                        help="Full image URI for the training container, e.g. us-central1-docker.pkg.dev/PROJECT/REPO/IMAGE")
     args = parser.parse_args()
 
-    # Step 1: Compile pipeline to YAML template and patch training image
+    # Step 1: Compile pipeline to YAML template
     from kfp import compiler
     template_path = "pipeline.yaml"
     compiler.Compiler().compile(
         pipeline_func=gourmetgram_training_pipeline,
         package_path=template_path,
     )
-    # Replace placeholder with actual training image URI
-    with open(template_path, "r") as f:
-        yaml_content = f.read()
-    yaml_content = yaml_content.replace("TRAINING_IMAGE_PLACEHOLDER", args.training_image)
-    with open(template_path, "w") as f:
-        f.write(yaml_content)
-    print(f"Pipeline compiled to {template_path} (training image: {args.training_image})")
+    print(f"Pipeline compiled to {template_path}")
 
     # Step 2: Upload template to GCS so it's accessible from the UI
     template_gcs_path = f"gs://{args.training_bucket}/pipeline-templates/gourmetgram-training.yaml"
