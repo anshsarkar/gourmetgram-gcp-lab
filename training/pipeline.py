@@ -482,10 +482,14 @@ def train_model(
 
             # Register model in Vertex AI Model Registry
             logger.info("Registering model in Vertex AI Model Registry...")
+            container_uri = f"{gcp_location}-docker.pkg.dev/{gcp_project}/gourmetgram-repo/gourmetgram"
             aiplatform.Model.upload(
                 display_name=f"gourmetgram-model-v{last_model_version}",
                 artifact_uri=f"gs://{training_bucket}/models/model_v{last_model_version}",
-                serving_container_image_uri="us-docker.pkg.dev/vertex-ai/prediction/pytorch-cpu.2-4:latest",
+                serving_container_image_uri=container_uri,
+                serving_container_predict_route="/api/predict",
+                serving_container_health_route="/test",
+                serving_container_ports=[8000],
             )
             logger.info("Model registered in Model Registry.")
 
