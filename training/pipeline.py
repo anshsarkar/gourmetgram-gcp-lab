@@ -456,6 +456,7 @@ def gourmetgram_training_pipeline(
     fine_tune_lr: float = 1e-5,
 ):
     data_task = prepare_data(training_bucket=training_bucket)
+    data_task.set_caching_options(False)
 
     custom_train_job = create_custom_training_job_from_component(
         train_model,
