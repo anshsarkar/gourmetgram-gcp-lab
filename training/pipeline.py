@@ -138,7 +138,7 @@ def prepare_data(
 # ---------------------------------------------------------------------------
 @dsl.component(
     base_image="us-docker.pkg.dev/vertex-ai/training/pytorch-gpu.2-4.py310:latest",
-    packages_to_install=["google-cloud-storage"],
+    packages_to_install=["google-cloud-storage", "google-cloud-aiplatform"],
 )
 def train_model(
     training_bucket: str,
@@ -150,6 +150,10 @@ def train_model(
     batch_size: int = 32,
     lr: float = 1e-4,
     fine_tune_lr: float = 1e-5,
+    experiment_name: str = "",
+    tensorboard_id: str = "",
+    gcp_project: str = "",
+    gcp_location: str = "us-central1",
 ):
     """Train or fine-tune MobileNetV2 on the collated dataset."""
     import json
@@ -273,6 +277,31 @@ def train_model(
         total_params = sum(p.numel() for p in model.parameters())
         logger.info(f"Model parameters: {total_params:,}")
 
+        # --- Experiment tracking (optional) ---
+        new_model_version = metadata.get("last_model_version", 0) + 1
+        tracking = bool(experiment_name)
+        if tracking:
+            from google.cloud import aiplatform
+            logger.info(f"Initializing experiment tracking: {experiment_name}")
+            aiplatform.init(
+                project=gcp_project,
+                location=gcp_location,
+                experiment=experiment_name,
+                experiment_tensorboard=tensorboard_id if tensorboard_id else None,
+            )
+            aiplatform.start_run(f"train-v{new_model_version}")
+            aiplatform.log_params({
+                "initial_epochs": initial_epochs,
+                "total_epochs": total_epochs,
+                "patience": patience,
+                "batch_size": batch_size,
+                "learning_rate": lr,
+                "fine_tune_lr": fine_tune_lr,
+                "data_versions": str(versions_collated),
+                "device": str(device),
+                "base_model": f"model_v{new_model_version - 1}" if new_model_version > 1 else "pretrained",
+            })
+
         # --- Phase 1: Train classification head only (backbone frozen) ---
         logger.info("=" * 60)
         logger.info("Phase 1: Training classification head (backbone frozen)")
@@ -327,6 +356,12 @@ def train_model(
                          f"Train Loss: {t_loss:.4f} Acc: {t_acc:.4f} | "
                          f"Val Loss: {v_loss:.4f} Acc: {v_acc:.4f} | "
                          f"Time: {elapsed:.1f}s")
+
+            if tracking:
+                aiplatform.log_time_series_metrics(
+                    {"train_loss": t_loss, "train_acc": t_acc, "val_loss": v_loss, "val_acc": v_acc},
+                    step=epoch,
+                )
 
             if v_loss < best_val_loss:
                 best_val_loss = v_loss
@@ -385,6 +420,12 @@ def train_model(
                          f"Val Loss: {v_loss:.4f} Acc: {v_acc:.4f} | "
                          f"Time: {elapsed:.1f}s")
 
+            if tracking:
+                aiplatform.log_time_series_metrics(
+                    {"train_loss": t_loss, "train_acc": t_acc, "val_loss": v_loss, "val_acc": v_acc},
+                    step=epoch,
+                )
+
             if v_loss < best_val_loss:
                 best_val_loss = v_loss
                 patience_counter = 0
@@ -402,7 +443,7 @@ def train_model(
         logger.info("=" * 60)
         logger.info("Uploading trained model to GCS")
         logger.info("=" * 60)
-        last_model_version = metadata.get("last_model_version", 0) + 1
+        last_model_version = new_model_version
 
         # Versioned model
         versioned_path = f"models/model_v{last_model_version}/food11.pth"
@@ -429,6 +470,28 @@ def train_model(
         trained_model.metadata["data_versions"] = versions_collated
 
         logger.info(f"Best validation loss: {best_val_loss:.4f}")
+
+        # --- Experiment tracking: log summary + register model ---
+        if tracking:
+            aiplatform.log_metrics({
+                "best_val_loss": best_val_loss,
+                "model_version": last_model_version,
+                "train_samples": len(train_dataset),
+                "val_samples": len(val_dataset),
+            })
+
+            # Register model in Vertex AI Model Registry
+            logger.info("Registering model in Vertex AI Model Registry...")
+            aiplatform.Model.upload(
+                display_name=f"gourmetgram-model-v{last_model_version}",
+                artifact_uri=f"gs://{training_bucket}/models/model_v{last_model_version}",
+                serving_container_image_uri="us-docker.pkg.dev/vertex-ai/prediction/pytorch-cpu.2-4:latest",
+            )
+            logger.info("Model registered in Model Registry.")
+
+            aiplatform.end_run()
+            logger.info("Experiment run ended.")
+
         logger.info("=== train_model completed successfully ===")
 
     except Exception as e:
@@ -454,6 +517,8 @@ def gourmetgram_training_pipeline(
     batch_size: int = 32,
     lr: float = 1e-4,
     fine_tune_lr: float = 1e-5,
+    experiment_name: str = "",
+    tensorboard_id: str = "",
 ):
     data_task = prepare_data(training_bucket=training_bucket)
     data_task.set_caching_options(False)
@@ -475,6 +540,10 @@ def gourmetgram_training_pipeline(
         batch_size=batch_size,
         lr=lr,
         fine_tune_lr=fine_tune_lr,
+        experiment_name=experiment_name,
+        tensorboard_id=tensorboard_id,
+        gcp_project=project,
+        gcp_location=location,
         project=project,
         location=location,
     )
@@ -496,6 +565,10 @@ if __name__ == "__main__":
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--fine-tune-lr", type=float, default=1e-5)
+    parser.add_argument("--experiment-name", default="",
+                        help="Vertex AI experiment name (enables tracking if set)")
+    parser.add_argument("--tensorboard-id", default="",
+                        help="Vertex AI TensorBoard resource ID (full path)")
     args = parser.parse_args()
 
     # Step 1: Compile pipeline to YAML template
@@ -533,6 +606,8 @@ if __name__ == "__main__":
             "batch_size": args.batch_size,
             "lr": args.lr,
             "fine_tune_lr": args.fine_tune_lr,
+            "experiment_name": args.experiment_name,
+            "tensorboard_id": args.tensorboard_id,
         },
     )
 
