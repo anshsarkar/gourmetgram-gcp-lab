@@ -155,6 +155,7 @@ def train_model(
     import logging
     import os
     import time
+    import traceback
 
     import torch
     import torch.nn as nn
@@ -166,233 +167,273 @@ def train_model(
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
     logger = logging.getLogger(__name__)
 
-    # Check if there's data to train on
-    versions_collated = collated_dataset.metadata.get("versions_collated", [])
-    if not versions_collated:
-        logger.info("No new data versions to train on. Skipping training.")
-        return
+    try:
+        # Check if there's data to train on
+        versions_collated = collated_dataset.metadata.get("versions_collated", [])
+        if not versions_collated:
+            logger.info("No new data versions to train on. Skipping training.")
+            return
 
-    client = storage.Client()
-    bucket = client.bucket(training_bucket)
+        logger.info(f"=== train_model started ===")
+        logger.info(f"Training bucket: {training_bucket}")
+        logger.info(f"Data versions to train on: {versions_collated}")
+        logger.info(f"Hyperparameters: initial_epochs={initial_epochs}, total_epochs={total_epochs}, "
+                     f"patience={patience}, batch_size={batch_size}, lr={lr}, fine_tune_lr={fine_tune_lr}")
 
-    # Download collated data locally
-    local_data_dir = "/tmp/collated"
-    os.makedirs(local_data_dir, exist_ok=True)
+        client = storage.Client()
+        bucket = client.bucket(training_bucket)
 
-    for split in ["training", "validation"]:
-        blobs = list(bucket.list_blobs(prefix=f"collated/{split}/"))
-        for blob in blobs:
-            if blob.name.lower().endswith((".jpg", ".jpeg", ".png")):
-                relative = blob.name[len("collated/"):]  # training/class_XX/file.jpg
-                local_path = os.path.join(local_data_dir, relative)
-                os.makedirs(os.path.dirname(local_path), exist_ok=True)
-                blob.download_to_filename(local_path)
-        logger.info(f"Downloaded {split} set locally")
+        # Download collated data locally
+        local_data_dir = "/tmp/collated"
+        os.makedirs(local_data_dir, exist_ok=True)
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    logger.info(f"Using device: {device}")
+        total_downloaded = 0
+        for split in ["training", "validation"]:
+            blobs = list(bucket.list_blobs(prefix=f"collated/{split}/"))
+            split_count = 0
+            for blob in blobs:
+                if blob.name.lower().endswith((".jpg", ".jpeg", ".png")):
+                    relative = blob.name[len("collated/"):]
+                    local_path = os.path.join(local_data_dir, relative)
+                    os.makedirs(os.path.dirname(local_path), exist_ok=True)
+                    blob.download_to_filename(local_path)
+                    split_count += 1
+                    if split_count % 200 == 0:
+                        logger.info(f"  Downloading {split}: {split_count} images...")
+            total_downloaded += split_count
+            logger.info(f"Downloaded {split} set: {split_count} images")
 
-    # Data transforms
-    train_transform = transforms.Compose([
-        transforms.Resize(224),
-        transforms.CenterCrop(224),
-        transforms.RandomHorizontalFlip(p=0.5),
-        transforms.RandomRotation(15),
-        transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-    ])
+        logger.info(f"Total images downloaded: {total_downloaded}")
 
-    val_transform = transforms.Compose([
-        transforms.Resize(224),
-        transforms.CenterCrop(224),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-    ])
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        logger.info(f"Using device: {device}")
+        if device.type == "cuda":
+            logger.info(f"GPU: {torch.cuda.get_device_name(0)}")
+            logger.info(f"GPU memory: {torch.cuda.get_device_properties(0).total_mem / 1e9:.1f} GB")
 
-    train_dataset = datasets.ImageFolder(os.path.join(local_data_dir, "training"), transform=train_transform)
-    val_dataset = datasets.ImageFolder(os.path.join(local_data_dir, "validation"), transform=val_transform)
+        # Data transforms
+        train_transform = transforms.Compose([
+            transforms.Resize(224),
+            transforms.CenterCrop(224),
+            transforms.RandomHorizontalFlip(p=0.5),
+            transforms.RandomRotation(15),
+            transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        ])
 
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=2)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=2)
+        val_transform = transforms.Compose([
+            transforms.Resize(224),
+            transforms.CenterCrop(224),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        ])
 
-    logger.info(f"Training samples: {len(train_dataset)}, Validation samples: {len(val_dataset)}")
-    logger.info(f"Classes: {train_dataset.classes}")
+        train_dataset = datasets.ImageFolder(os.path.join(local_data_dir, "training"), transform=train_transform)
+        val_dataset = datasets.ImageFolder(os.path.join(local_data_dir, "validation"), transform=val_transform)
 
-    # Build model
-    model = models.mobilenet_v2(weights="MobileNet_V2_Weights.DEFAULT")
-    num_ftrs = model.last_channel
-    model.classifier = nn.Sequential(
-        nn.Dropout(0.5),
-        nn.Linear(num_ftrs, 11),
-    )
+        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=2)
+        val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=2)
 
-    # Check for existing trained model to fine-tune
-    metadata_blob = bucket.blob("training_metadata.json")
-    if metadata_blob.exists():
-        metadata = json.loads(metadata_blob.download_as_text())
-        last_model_version = metadata.get("last_model_version", 0)
-        if last_model_version > 0:
-            model_path = f"models/model_v{last_model_version}/food11.pth"
-            model_blob = bucket.blob(model_path)
-            if model_blob.exists():
-                logger.info(f"Loading existing model: model_v{last_model_version} for fine-tuning")
-                local_model = "/tmp/food11_prev.pth"
-                model_blob.download_to_filename(local_model)
-                state = torch.load(local_model, map_location=device)
-                model.load_state_dict(state)
-            else:
-                logger.info(f"Model file not found at {model_path}. Training from scratch.")
-    else:
-        metadata = {}
-        logger.info("No previous model found. Training from scratch with pretrained MobileNetV2.")
+        logger.info(f"Training samples: {len(train_dataset)}, Validation samples: {len(val_dataset)}")
+        logger.info(f"Classes ({len(train_dataset.classes)}): {train_dataset.classes}")
 
-    model = model.to(device)
+        # Build model
+        logger.info("Building MobileNetV2 model...")
+        model = models.mobilenet_v2(weights="MobileNet_V2_Weights.DEFAULT")
+        num_ftrs = model.last_channel
+        model.classifier = nn.Sequential(
+            nn.Dropout(0.5),
+            nn.Linear(num_ftrs, 11),
+        )
 
-    # --- Phase 1: Train classification head only (backbone frozen) ---
-    logger.info("=== Phase 1: Training classification head (backbone frozen) ===")
-    for param in model.features.parameters():
-        param.requires_grad = False
-
-    criterion = nn.CrossEntropyLoss()
-    optimizer = optim.Adam(model.classifier.parameters(), lr=lr)
-
-    best_val_loss = float("inf")
-    best_model_path = "/tmp/food11_best.pth"
-
-    for epoch in range(initial_epochs):
-        start = time.time()
-        model.train()
-        train_loss, train_correct, train_total = 0.0, 0, 0
-        for inputs, labels in train_loader:
-            inputs, labels = inputs.to(device), labels.to(device)
-            optimizer.zero_grad()
-            outputs = model(inputs)
-            loss = criterion(outputs, labels)
-            loss.backward()
-            optimizer.step()
-            train_loss += loss.item()
-            _, predicted = outputs.max(1)
-            train_total += labels.size(0)
-            train_correct += predicted.eq(labels).sum().item()
-
-        # Validation
-        model.eval()
-        val_loss, val_correct, val_total = 0.0, 0, 0
-        with torch.no_grad():
-            for inputs, labels in val_loader:
-                inputs, labels = inputs.to(device), labels.to(device)
-                outputs = model(inputs)
-                loss = criterion(outputs, labels)
-                val_loss += loss.item()
-                _, predicted = outputs.max(1)
-                val_total += labels.size(0)
-                val_correct += predicted.eq(labels).sum().item()
-
-        t_loss = train_loss / len(train_loader)
-        t_acc = train_correct / train_total
-        v_loss = val_loss / len(val_loader)
-        v_acc = val_correct / val_total
-        elapsed = time.time() - start
-
-        logger.info(f"Epoch {epoch+1}/{initial_epochs} | "
-                     f"Train Loss: {t_loss:.4f} Acc: {t_acc:.4f} | "
-                     f"Val Loss: {v_loss:.4f} Acc: {v_acc:.4f} | "
-                     f"Time: {elapsed:.1f}s")
-
-        if v_loss < best_val_loss:
-            best_val_loss = v_loss
-            torch.save(model.state_dict(), best_model_path)
-            logger.info("  -> Validation loss improved. Model checkpoint saved.")
-
-    # --- Phase 2: Fine-tune entire model (backbone unfrozen) ---
-    logger.info("=== Phase 2: Fine-tuning entire model (backbone unfrozen) ===")
-    for param in model.features.parameters():
-        param.requires_grad = True
-
-    optimizer = optim.Adam(model.parameters(), lr=fine_tune_lr)
-    patience_counter = 0
-
-    for epoch in range(initial_epochs, total_epochs):
-        start = time.time()
-        model.train()
-        train_loss, train_correct, train_total = 0.0, 0, 0
-        for inputs, labels in train_loader:
-            inputs, labels = inputs.to(device), labels.to(device)
-            optimizer.zero_grad()
-            outputs = model(inputs)
-            loss = criterion(outputs, labels)
-            loss.backward()
-            optimizer.step()
-            train_loss += loss.item()
-            _, predicted = outputs.max(1)
-            train_total += labels.size(0)
-            train_correct += predicted.eq(labels).sum().item()
-
-        model.eval()
-        val_loss, val_correct, val_total = 0.0, 0, 0
-        with torch.no_grad():
-            for inputs, labels in val_loader:
-                inputs, labels = inputs.to(device), labels.to(device)
-                outputs = model(inputs)
-                loss = criterion(outputs, labels)
-                val_loss += loss.item()
-                _, predicted = outputs.max(1)
-                val_total += labels.size(0)
-                val_correct += predicted.eq(labels).sum().item()
-
-        t_loss = train_loss / len(train_loader)
-        t_acc = train_correct / train_total
-        v_loss = val_loss / len(val_loader)
-        v_acc = val_correct / val_total
-        elapsed = time.time() - start
-
-        logger.info(f"Epoch {epoch+1}/{total_epochs} | "
-                     f"Train Loss: {t_loss:.4f} Acc: {t_acc:.4f} | "
-                     f"Val Loss: {v_loss:.4f} Acc: {v_acc:.4f} | "
-                     f"Time: {elapsed:.1f}s")
-
-        if v_loss < best_val_loss:
-            best_val_loss = v_loss
-            patience_counter = 0
-            torch.save(model.state_dict(), best_model_path)
-            logger.info("  -> Validation loss improved. Model checkpoint saved.")
+        # Check for existing trained model to fine-tune
+        metadata_blob = bucket.blob("training_metadata.json")
+        if metadata_blob.exists():
+            metadata = json.loads(metadata_blob.download_as_text())
+            last_model_version = metadata.get("last_model_version", 0)
+            if last_model_version > 0:
+                model_path = f"models/model_v{last_model_version}/food11.pth"
+                model_blob = bucket.blob(model_path)
+                if model_blob.exists():
+                    logger.info(f"Loading existing model: model_v{last_model_version} for fine-tuning")
+                    local_model = "/tmp/food11_prev.pth"
+                    model_blob.download_to_filename(local_model)
+                    state = torch.load(local_model, map_location=device)
+                    model.load_state_dict(state)
+                    logger.info("Previous model weights loaded successfully.")
+                else:
+                    logger.info(f"Model file not found at {model_path}. Training from scratch.")
         else:
-            patience_counter += 1
-            logger.info(f"  -> No improvement. Patience: {patience_counter}/{patience}")
+            metadata = {}
+            logger.info("No previous model found. Training from scratch with pretrained MobileNetV2.")
 
-        if patience_counter >= patience:
-            logger.info("  Early stopping triggered.")
-            break
+        model = model.to(device)
+        total_params = sum(p.numel() for p in model.parameters())
+        logger.info(f"Model parameters: {total_params:,}")
 
-    # --- Upload trained model to GCS ---
-    last_model_version = metadata.get("last_model_version", 0) + 1
-    logger.info(f"Uploading model as model_v{last_model_version}...")
+        # --- Phase 1: Train classification head only (backbone frozen) ---
+        logger.info("=" * 60)
+        logger.info("Phase 1: Training classification head (backbone frozen)")
+        logger.info("=" * 60)
+        for param in model.features.parameters():
+            param.requires_grad = False
 
-    # Versioned model
-    versioned_path = f"models/model_v{last_model_version}/food11.pth"
-    bucket.blob(versioned_path).upload_from_filename(best_model_path)
+        trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        logger.info(f"Trainable parameters: {trainable_params:,} / {total_params:,}")
 
-    # Latest model
-    bucket.blob("models/latest/food11.pth").upload_from_filename(best_model_path)
+        criterion = nn.CrossEntropyLoss()
+        optimizer = optim.Adam(model.classifier.parameters(), lr=lr)
 
-    logger.info(f"Model uploaded to gs://{training_bucket}/{versioned_path}")
-    logger.info(f"Model also copied to gs://{training_bucket}/models/latest/food11.pth")
+        best_val_loss = float("inf")
+        best_model_path = "/tmp/food11_best.pth"
 
-    # Update training metadata
-    max_version = max(versions_collated)
-    metadata["last_trained_version"] = max_version
-    metadata["last_model_version"] = last_model_version
-    metadata["trained_on_data_versions"] = versions_collated
+        for epoch in range(initial_epochs):
+            start = time.time()
+            model.train()
+            train_loss, train_correct, train_total = 0.0, 0, 0
+            for inputs, labels in train_loader:
+                inputs, labels = inputs.to(device), labels.to(device)
+                optimizer.zero_grad()
+                outputs = model(inputs)
+                loss = criterion(outputs, labels)
+                loss.backward()
+                optimizer.step()
+                train_loss += loss.item()
+                _, predicted = outputs.max(1)
+                train_total += labels.size(0)
+                train_correct += predicted.eq(labels).sum().item()
 
-    metadata_blob.upload_from_string(
-        json.dumps(metadata, indent=2), content_type="application/json"
-    )
-    logger.info(f"Training metadata updated: last_trained_version=v{max_version}, model=model_v{last_model_version}")
+            model.eval()
+            val_loss, val_correct, val_total = 0.0, 0, 0
+            with torch.no_grad():
+                for inputs, labels in val_loader:
+                    inputs, labels = inputs.to(device), labels.to(device)
+                    outputs = model(inputs)
+                    loss = criterion(outputs, labels)
+                    val_loss += loss.item()
+                    _, predicted = outputs.max(1)
+                    val_total += labels.size(0)
+                    val_correct += predicted.eq(labels).sum().item()
 
-    trained_model.uri = f"gs://{training_bucket}/{versioned_path}"
-    trained_model.metadata["model_version"] = last_model_version
-    trained_model.metadata["data_versions"] = versions_collated
+            t_loss = train_loss / len(train_loader)
+            t_acc = train_correct / train_total
+            v_loss = val_loss / len(val_loader)
+            v_acc = val_correct / val_total
+            elapsed = time.time() - start
+
+            logger.info(f"Epoch {epoch+1}/{initial_epochs} | "
+                         f"Train Loss: {t_loss:.4f} Acc: {t_acc:.4f} | "
+                         f"Val Loss: {v_loss:.4f} Acc: {v_acc:.4f} | "
+                         f"Time: {elapsed:.1f}s")
+
+            if v_loss < best_val_loss:
+                best_val_loss = v_loss
+                torch.save(model.state_dict(), best_model_path)
+                logger.info("  -> Validation loss improved. Model checkpoint saved.")
+
+        # --- Phase 2: Fine-tune entire model (backbone unfrozen) ---
+        logger.info("=" * 60)
+        logger.info("Phase 2: Fine-tuning entire model (backbone unfrozen)")
+        logger.info("=" * 60)
+        for param in model.features.parameters():
+            param.requires_grad = True
+
+        trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        logger.info(f"Trainable parameters: {trainable_params:,} / {total_params:,}")
+
+        optimizer = optim.Adam(model.parameters(), lr=fine_tune_lr)
+        patience_counter = 0
+
+        for epoch in range(initial_epochs, total_epochs):
+            start = time.time()
+            model.train()
+            train_loss, train_correct, train_total = 0.0, 0, 0
+            for inputs, labels in train_loader:
+                inputs, labels = inputs.to(device), labels.to(device)
+                optimizer.zero_grad()
+                outputs = model(inputs)
+                loss = criterion(outputs, labels)
+                loss.backward()
+                optimizer.step()
+                train_loss += loss.item()
+                _, predicted = outputs.max(1)
+                train_total += labels.size(0)
+                train_correct += predicted.eq(labels).sum().item()
+
+            model.eval()
+            val_loss, val_correct, val_total = 0.0, 0, 0
+            with torch.no_grad():
+                for inputs, labels in val_loader:
+                    inputs, labels = inputs.to(device), labels.to(device)
+                    outputs = model(inputs)
+                    loss = criterion(outputs, labels)
+                    val_loss += loss.item()
+                    _, predicted = outputs.max(1)
+                    val_total += labels.size(0)
+                    val_correct += predicted.eq(labels).sum().item()
+
+            t_loss = train_loss / len(train_loader)
+            t_acc = train_correct / train_total
+            v_loss = val_loss / len(val_loader)
+            v_acc = val_correct / val_total
+            elapsed = time.time() - start
+
+            logger.info(f"Epoch {epoch+1}/{total_epochs} | "
+                         f"Train Loss: {t_loss:.4f} Acc: {t_acc:.4f} | "
+                         f"Val Loss: {v_loss:.4f} Acc: {v_acc:.4f} | "
+                         f"Time: {elapsed:.1f}s")
+
+            if v_loss < best_val_loss:
+                best_val_loss = v_loss
+                patience_counter = 0
+                torch.save(model.state_dict(), best_model_path)
+                logger.info("  -> Validation loss improved. Model checkpoint saved.")
+            else:
+                patience_counter += 1
+                logger.info(f"  -> No improvement. Patience: {patience_counter}/{patience}")
+
+            if patience_counter >= patience:
+                logger.info("  Early stopping triggered.")
+                break
+
+        # --- Upload trained model to GCS ---
+        logger.info("=" * 60)
+        logger.info("Uploading trained model to GCS")
+        logger.info("=" * 60)
+        last_model_version = metadata.get("last_model_version", 0) + 1
+
+        # Versioned model
+        versioned_path = f"models/model_v{last_model_version}/food11.pth"
+        bucket.blob(versioned_path).upload_from_filename(best_model_path)
+        logger.info(f"Versioned model saved: gs://{training_bucket}/{versioned_path}")
+
+        # Latest model
+        bucket.blob("models/latest/food11.pth").upload_from_filename(best_model_path)
+        logger.info(f"Latest model updated: gs://{training_bucket}/models/latest/food11.pth")
+
+        # Update training metadata
+        max_version = max(versions_collated)
+        metadata["last_trained_version"] = max_version
+        metadata["last_model_version"] = last_model_version
+        metadata["trained_on_data_versions"] = versions_collated
+
+        metadata_blob.upload_from_string(
+            json.dumps(metadata, indent=2), content_type="application/json"
+        )
+        logger.info(f"Training metadata updated: last_trained_version=v{max_version}, model=model_v{last_model_version}")
+
+        trained_model.uri = f"gs://{training_bucket}/{versioned_path}"
+        trained_model.metadata["model_version"] = last_model_version
+        trained_model.metadata["data_versions"] = versions_collated
+
+        logger.info(f"Best validation loss: {best_val_loss:.4f}")
+        logger.info("=== train_model completed successfully ===")
+
+    except Exception as e:
+        logger.error(f"train_model FAILED: {e}")
+        logger.error(traceback.format_exc())
+        raise
 
 
 # ---------------------------------------------------------------------------
