@@ -444,8 +444,8 @@ def train_model(
 )
 def gourmetgram_training_pipeline(
     training_bucket: str,
-    initial_epochs: int = 5,
-    total_epochs: int = 20,
+    initial_epochs: int = 1,
+    total_epochs: int = 1,
     patience: int = 5,
     batch_size: int = 32,
     lr: float = 1e-4,
