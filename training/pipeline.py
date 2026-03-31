@@ -1,6 +1,7 @@
 import argparse
 
 from google.cloud import aiplatform
+from google_cloud_pipeline_components.v1.custom_job import create_custom_training_job_from_component
 from kfp import dsl
 from kfp.dsl import Dataset, Input, Model, Output
 
@@ -444,6 +445,8 @@ def train_model(
 )
 def gourmetgram_training_pipeline(
     training_bucket: str,
+    project: str = "",
+    location: str = "us-central1",
     initial_epochs: int = 1,
     total_epochs: int = 1,
     patience: int = 5,
@@ -453,7 +456,15 @@ def gourmetgram_training_pipeline(
 ):
     data_task = prepare_data(training_bucket=training_bucket)
 
-    train_task = train_model(
+    custom_train_job = create_custom_training_job_from_component(
+        train_model,
+        display_name="gourmetgram-train",
+        machine_type="n1-standard-4",
+        accelerator_type="NVIDIA_TESLA_T4",
+        accelerator_count=1,
+    )
+
+    train_task = custom_train_job(
         training_bucket=training_bucket,
         collated_dataset=data_task.outputs["collated_dataset"],
         initial_epochs=initial_epochs,
@@ -462,9 +473,9 @@ def gourmetgram_training_pipeline(
         batch_size=batch_size,
         lr=lr,
         fine_tune_lr=fine_tune_lr,
+        project=project,
+        location=location,
     )
-    train_task.set_accelerator_type("NVIDIA_TESLA_T4")
-    train_task.set_accelerator_limit(1)
 
 
 # ---------------------------------------------------------------------------
@@ -520,6 +531,8 @@ if __name__ == "__main__":
         pipeline_root=args.pipeline_root,
         parameter_values={
             "training_bucket": args.training_bucket,
+            "project": args.project,
+            "location": args.region,
             "initial_epochs": args.initial_epochs,
             "total_epochs": args.total_epochs,
             "patience": args.patience,
