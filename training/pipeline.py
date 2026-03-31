@@ -137,7 +137,7 @@ def prepare_data(
 # ---------------------------------------------------------------------------
 @dsl.component(
     base_image="pytorch/pytorch:2.5.1-cuda12.4-cudnn9-runtime",
-    packages_to_install=["google-cloud-storage", "torchvision", "Pillow"],
+    packages_to_install=["google-cloud-storage"],
 )
 def train_model(
     training_bucket: str,
