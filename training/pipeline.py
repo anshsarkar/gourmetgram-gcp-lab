@@ -137,7 +137,7 @@ def prepare_data(
 # Component 2: Train Model
 # ---------------------------------------------------------------------------
 @dsl.component(
-    base_image="us-docker.pkg.dev/vertex-ai/training/pytorch-gpu.2-4:latest",
+    base_image="us-docker.pkg.dev/vertex-ai/training/pytorch-gpu.2-4.py310:latest",
     packages_to_install=["google-cloud-storage"],
 )
 def train_model(
