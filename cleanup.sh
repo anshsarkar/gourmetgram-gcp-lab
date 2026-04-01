@@ -57,14 +57,40 @@ gsutil rm -r gs://$GCS_STAGING_BUCKET 2>/dev/null || echo "  Staging bucket not 
 gsutil rm -r gs://$GCS_TRAINING_BUCKET 2>/dev/null || echo "  Training bucket not found, skipping"
 gsutil rm -r gs://$GCS_EVENTARC_BUCKET 2>/dev/null || echo "  Eventarc bucket not found, skipping"
 
+# --- Vertex AI Endpoint ---
+echo "[9/14] Deleting Vertex AI Endpoint (undeploys all models first)..."
+ENDPOINT_ID=$(gcloud ai endpoints list --region=$REGION --format="value(name)" --filter="displayName=gourmetgram-endpoint" --limit=1 2>/dev/null)
+if [ -n "$ENDPOINT_ID" ]; then
+  gcloud ai endpoints undeploy-model $ENDPOINT_ID --all --region=$REGION --quiet 2>/dev/null || true
+  gcloud ai endpoints delete $ENDPOINT_ID --region=$REGION --quiet 2>/dev/null || true
+else
+  echo "  (not found, skipping)"
+fi
+
+# --- Vertex AI Models ---
+echo "[10/14] Deleting Vertex AI models..."
+for MODEL in $(gcloud ai models list --region=$REGION --format="value(name)" --filter="displayName~gourmetgram" 2>/dev/null); do
+  gcloud ai models delete $MODEL --region=$REGION --quiet 2>/dev/null || true
+done
+
+# --- Vertex AI TensorBoard ---
+echo "[11/14] Deleting Vertex AI TensorBoard instances..."
+for TB in $(gcloud ai tensorboards list --region=$REGION --format="value(name)" 2>/dev/null); do
+  gcloud ai tensorboards delete $TB --region=$REGION --quiet 2>/dev/null || true
+done
+
+# --- Vertex AI Experiments ---
+echo "[12/14] Deleting Vertex AI Experiments..."
+gcloud ai experiments delete gourmetgram-experiment --region=$REGION --quiet 2>/dev/null || echo "  (not found, skipping)"
+
 # --- Artifact Registry Images ---
-echo "[9/10] Deleting Artifact Registry images..."
+echo "[13/14] Deleting Artifact Registry images..."
 gcloud artifacts docker images delete $REGION-docker.pkg.dev/$GCP_PROJECT_ID/gourmetgram-repo/gourmetgram --delete-tags --quiet 2>/dev/null || echo "  gourmetgram image not found, skipping"
 gcloud artifacts docker images delete $REGION-docker.pkg.dev/$GCP_PROJECT_ID/gourmetgram-repo/batch-data-job --delete-tags --quiet 2>/dev/null || echo "  batch-data-job image not found, skipping"
 gcloud artifacts docker images delete $REGION-docker.pkg.dev/$GCP_PROJECT_ID/gourmetgram-repo/gourmetgram-training --delete-tags --quiet 2>/dev/null || echo "  gourmetgram-training image not found, skipping"
 
 # --- Artifact Registry Repo ---
-echo "[10/10] Deleting Artifact Registry repository..."
+echo "[14/14] Deleting Artifact Registry repository..."
 gcloud artifacts repositories delete gourmetgram-repo --location=$REGION --quiet 2>/dev/null || echo "  (not found, skipping)"
 
 echo ""
