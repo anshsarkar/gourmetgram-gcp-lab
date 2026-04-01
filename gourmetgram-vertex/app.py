@@ -44,17 +44,24 @@ model.classifier = torch.nn.Sequential(
     torch.nn.Linear(num_ftrs, 11)
 )
 
-# Vertex AI Endpoints mount model artifacts and set AIP_STORAGE_URI
-# Fall back to bundled model for Cloud Run / GKE deployments
+# Vertex AI Endpoints set AIP_STORAGE_URI to a GCS path (gs://...).
+# Custom containers must download artifacts themselves.
+# Fall back to bundled model for Cloud Run / GKE deployments.
 aip_storage = os.environ.get("AIP_STORAGE_URI", "")
 if aip_storage:
-    model_path = os.path.join(aip_storage, "food11.pth")
-    logging.info(f"Loading model from Vertex AI artifact: {model_path}")
+    gcs_uri = aip_storage.rstrip("/") + "/food11.pth"
+    local_model_path = "/tmp/food11.pth"
+    logging.info(f"Downloading model from Vertex AI artifact: {gcs_uri}")
+    client = storage.Client()
+    blob = storage.Blob.from_string(gcs_uri, client=client)
+    blob.download_to_filename(local_model_path)
+    model_path = local_model_path
+    logging.info("Model downloaded successfully")
 else:
     model_path = "food11.pth"
     logging.info("Loading bundled model: food11.pth")
 
-state = torch.load(model_path, map_location=torch.device('cpu'))
+state = torch.load(model_path, map_location=torch.device('cpu'), weights_only=True)
 model.load_state_dict(state)
 model.eval()
 
