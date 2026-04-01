@@ -3,6 +3,7 @@ import logging
 import os
 import sys
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 
@@ -82,7 +83,16 @@ def batch_copy():
         nonlocal copied
         relative_path = blob.name[len("incoming/"):]
         dest_path = f"datasets/Food-11/v{version}/training/{relative_path}"
-        staging_bucket.copy_blob(blob, training_bucket, new_name=dest_path)
+        for attempt in range(3):
+            try:
+                staging_bucket.copy_blob(blob, training_bucket, new_name=dest_path)
+                break
+            except Exception as e:
+                if attempt < 2:
+                    time.sleep(2 ** attempt)
+                    logger.warning(f"Retry {attempt+1} for {blob.name}: {e}")
+                else:
+                    raise
         class_name = relative_path.split("/")[0]
         with lock:
             copied += 1
