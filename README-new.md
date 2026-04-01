@@ -1351,23 +1351,29 @@ gcloud ai endpoints deploy-model $ENDPOINT_ID \
 
 This takes a few minutes. You can monitor the deployment in the console: [Vertex AI Endpoints](https://console.cloud.google.com/vertex-ai/endpoints)
 
+If you click on the endpoint and go to the **Deployed models** tab, you'll see the model being deployed in real time. Once it finishes, the status will change to "Deployed" and it will show 100% traffic.
+Also if you click on the deployment it will take you to the model registry entry for that model — you can see the model details and the GCS path to the model artifacts.
+
 ### Test the endpoint
 
 Once the deployment is ready, send a test prediction:
 
 ```
 # run in Cloud Shell
-ENDPOINT_RESOURCE=$(gcloud ai endpoints list --region=$REGION --format="value(name)" --filter="displayName=gourmetgram-endpoint" --limit=1)
+ENDPOINT_RESOURCE="projects/$GCP_PROJECT_ID/locations/$REGION/endpoints/$ENDPOINT_ID"
 
 # Encode the test image as base64
 BASE64_IMAGE=$(base64 -w 0 ~/gourmetgram-gcp-lab/gourmetgram-vertex/instance/uploads/test_image.jpeg)
+
+# Write request payload to file (base64 image is too large for command line args)
+echo "{\"instances\": [{\"image\": \"$BASE64_IMAGE\"}]}" > /tmp/request.json
 
 # Send a prediction request
 curl -X POST \
   -H "Authorization: Bearer $(gcloud auth print-access-token)" \
   -H "Content-Type: application/json" \
   "https://$REGION-aiplatform.googleapis.com/v1/$ENDPOINT_RESOURCE:predict" \
-  -d "{\"instances\": [{\"image\": \"$BASE64_IMAGE\"}]}"
+  -d @/tmp/request.json
 ```
 
 You should see a prediction response with the food class and confidence score.
@@ -1407,7 +1413,7 @@ for i in $(seq 1 10); do
     -H "Authorization: Bearer $(gcloud auth print-access-token)" \
     -H "Content-Type: application/json" \
     "https://$REGION-aiplatform.googleapis.com/v1/$ENDPOINT_RESOURCE:predict" \
-    -d "{\"instances\": [{\"image\": \"$BASE64_IMAGE\"}]}" | python3 -c "import sys,json; r=json.loads(sys.stdin.read()); print(f'Request {$i}: {r}')"
+    -d @/tmp/request.json | python3 -c "import sys,json; r=json.loads(sys.stdin.read()); print(f'Request {$i}: {r}')"
 done
 ```
 

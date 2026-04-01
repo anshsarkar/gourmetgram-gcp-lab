@@ -61,7 +61,10 @@ gsutil rm -r gs://$GCS_EVENTARC_BUCKET 2>/dev/null || echo "  Eventarc bucket no
 echo "[9/14] Deleting Vertex AI Endpoint (undeploys all models first)..."
 ENDPOINT_ID=$(gcloud ai endpoints list --region=$REGION --format="value(name)" --filter="displayName=gourmetgram-endpoint" --limit=1 2>/dev/null)
 if [ -n "$ENDPOINT_ID" ]; then
-  gcloud ai endpoints undeploy-model $ENDPOINT_ID --all --region=$REGION --quiet 2>/dev/null || true
+  # Undeploy each model individually (--all flag doesn't exist)
+  for DM_ID in $(gcloud ai endpoints describe $ENDPOINT_ID --region=$REGION --format="json" 2>/dev/null | python3 -c "import sys,json; [print(m['id']) for m in json.loads(sys.stdin.read()).get('deployedModels',[])]" 2>/dev/null); do
+    gcloud ai endpoints undeploy-model $ENDPOINT_ID --deployed-model-id=$DM_ID --region=$REGION --quiet 2>/dev/null || true
+  done
   gcloud ai endpoints delete $ENDPOINT_ID --region=$REGION --quiet 2>/dev/null || true
 else
   echo "  (not found, skipping)"

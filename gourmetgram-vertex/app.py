@@ -97,15 +97,30 @@ def upload():
 @app.route('/api/predict', methods=['POST'])
 def api_predict():
     data = request.get_json()
-    if not data or 'image' not in data:
+    if not data:
+        return jsonify({"error": "no JSON body"}), 400
+
+    # Vertex AI Endpoints wraps requests: {"instances": [{"image": "..."}]}
+    vertex_format = 'instances' in data
+    if vertex_format:
+        instance = data['instances'][0]
+        if 'image' not in instance:
+            return jsonify({"error": "missing 'image' field"}), 400
+        img_bytes = base64.b64decode(instance['image'])
+    elif 'image' in data:
+        img_bytes = base64.b64decode(data['image'])
+    else:
         return jsonify({"error": "missing 'image' field"}), 400
-    img_bytes = base64.b64decode(data['image'])
+
     img = Image.open(io.BytesIO(img_bytes)).convert('RGB')
     temp_path = os.path.join(app.instance_path, 'uploads', f"{uuid.uuid4().hex}.jpg")
     img.save(temp_path)
     preds, probs = model_predict(temp_path, model)
     upload_to_gcs(img_bytes, preds, os.path.basename(temp_path))
     os.remove(temp_path)
+
+    if vertex_format:
+        return jsonify({"predictions": [{"prediction": preds, "confidence": probs}]})
     return jsonify({"prediction": preds, "confidence": probs})
 
 @app.route('/event', methods=['POST'])
