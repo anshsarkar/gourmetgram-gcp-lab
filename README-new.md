@@ -78,14 +78,7 @@ gcloud services enable \
   cloudscheduler.googleapis.com
 ```
 
-> **Note:** If you encounter IAM or permission errors at any point during this lab, run `gcloud auth login` in Cloud Shell to re-authenticate and refresh your credentials.
-
-```
-# run in Cloud Shell
-gcloud auth login
-```
-
-Follow the link to authenticate, then come back to Cloud Shell.
+> **Note:** If you encounter authentication or permission errors at any point during this lab, see the [Troubleshooting](#troubleshooting) section at the bottom.
 
 ### Create a container image
 
@@ -315,14 +308,7 @@ We will deploy GourmetGram using Google Cloud Run, which is a serverless offerin
 
 (These instructions assume you have already defined the environment variables in the previous steps!)
 
-Before deploying, make sure your Cloud Shell is authenticated. If you see an error about no active account, run:
-
-```
-# run in Cloud Shell
-gcloud auth login
-```
-
-Follow the link to authenticate, then come back to Cloud Shell. Now deploy:
+Now deploy:
 
 ```
 # run in Cloud Shell
@@ -353,7 +339,7 @@ As you generate traffic against your service, you will see the "Container instan
 
 ### Synthetic traffic and scaling
 
-So far we've deployed GourmetGram on both a managed Kubernetes cluster and as a serverless Cloud Run service. Now, let's simulate real-world traffic to see how these services scale — and in the process, collect data that we can use later for retraining the model.
+So far we've deployed GourmetGram on both a managed Kubernetes cluster and as a serverless Cloud Run service. Now, let's simulate real-world traffic to compare how each deployment option scales under load. After that, we'll add Cloud Storage integration to collect data for retraining, and finally set up an event-driven inference pipeline.
 
 First, make sure your environment variables are still set (if your Cloud Shell session restarted, you will need to re-export these):
 
@@ -401,79 +387,9 @@ Visit `http://<VM_EXTERNAL_IP>:8000` in your browser to verify it's serving, the
 
 You can see your VM instance in the Google Cloud Console: [Compute Engine](https://console.cloud.google.com/compute/instances)
 
-#### Set up data collection
-
-Set your NYU Net ID and the staging bucket name — the Net ID ensures your bucket name is unique across GCP:
-
-```
-# run in Cloud Shell
-export NET_ID="your-net-id"
-export GCS_STAGING_BUCKET="${NET_ID}-staging-bucket"
-```
-
-Create the staging bucket:
-
-```
-# run in Cloud Shell
-gcloud storage buckets create gs://$GCS_STAGING_BUCKET \
-    --location=us-central1 \
-    --uniform-bucket-level-access
-```
-
-You can verify the bucket was created in the Google Cloud Console: [Cloud Storage](https://console.cloud.google.com/storage/browser)
-
-Now run the setup script included in the lab repo. This will download the Food-11 dataset and organize the images into class directories (`class_00/` through `class_10/`):
-
-```
-# run in Cloud Shell
-cd ~/gourmetgram-gcp-lab
-bash data_generator/setup_data.sh
-```
-
-Next, redeploy the GourmetGram service on Cloud Run with the staging bucket configured. This tells the service to save a copy of every incoming image to Cloud Storage as it classifies it:
-
-```
-# run in Cloud Shell
-gcloud run deploy $SERVICE_NAME \
-  --image $REGION-docker.pkg.dev/$GCP_PROJECT_ID/$REPO_NAME/$IMAGE_NAME \
-  --platform managed \
-  --region $REGION \
-  --allow-unauthenticated \
-  --port 8000 \
-  --memory=2Gi \
-  --timeout=600 \
-  --set-env-vars="GCS_STAGING_BUCKET=$GCS_STAGING_BUCKET"
-```
-
-Now let's generate some traffic! Install the traffic generator's dependencies and run it against the Cloud Run service:
-
-```
-# run in Cloud Shell
-export SERVICE_URL=$(gcloud run services describe $SERVICE_NAME --region $REGION --format 'value(status.url)')
-pip install -r data_generator/requirements.txt
-python data_generator/generate_traffic.py --mode predict
-```
-
-The `--mode predict` flag sends base64-encoded food images to the `/api/predict` endpoint. The service classifies each image and saves a copy to the GCS staging bucket — this is how we collect "production" data for retraining later. The generator sends 3 bursts with 60-second pauses between them. The first two bursts send 200 images sequentially. The final burst sends 800 images concurrently (20 parallel workers) — this spike in concurrent requests is what forces Cloud Run to scale up multiple instances.
-
-While it runs, check the Cloud Run metrics in the console — you should see the instance count scale up during bursts and back down during pauses: [Cloud Run](https://console.cloud.google.com/run)
-
-> **Note:** The generator also supports `--mode load`, which hits the lightweight `/test` endpoint with GET requests instead of sending images. This generates CPU load without collecting data to GCS — we'll use this mode later when comparing GKE scaling behavior.
-
-After the generator finishes, check the staging bucket for the captured images:
-
-```
-# run in Cloud Shell
-gsutil ls gs://$GCS_STAGING_BUCKET/incoming/
-```
-
-You should see class directories (`class_00/` through `class_10/`) containing the images the service classified. These are organized by the model's predicted class — simulating how production data would accumulate over time as real users interact with the service. You can also browse the bucket contents in the Google Cloud Console: [Cloud Storage](https://console.cloud.google.com/storage/browser)
-
-#### GKE scaling comparison: static vs autoscaling
+#### Static GKE deployment (fixed replicas)
 
 Earlier in the lab, we deployed GourmetGram on GKE with a Horizontal Pod Autoscaler (HPA) that scales pods between 1 and 5 based on CPU usage. Now let's create a second deployment in the same cluster with a **fixed** number of replicas and no autoscaler, so we can compare how each handles the same traffic.
-
-Create the static deployment:
 
 ```
 # run in Cloud Shell
@@ -543,19 +459,35 @@ kubectl get pods -l app=gourmetgram-static
 kubectl get service gourmetgram-static-service
 ```
 
-You should see 2 pods running. Note the external IP — this is the static deployment. Now let's also get the HPA deployment's external IP:
+You should see 2 pods running.
+
+#### Scaling comparison
+
+Now we have four different ways of running GourmetGram: an always-on VM, a static GKE deployment (fixed replicas), a GKE deployment with HPA (autoscaling), and Cloud Run (serverless). Let's send the same traffic to the three scalable options and compare how each handles the load.
+
+The `--mode load` flag hits the lightweight `/test` endpoint with GET requests — this generates CPU load to trigger scaling without involving any external services (no GCS, no image processing). Install the generator dependencies first:
 
 ```
 # run in Cloud Shell
-kubectl get service gourmetgram-service
+cd ~/gourmetgram-gcp-lab
+pip install -r data_generator/requirements.txt
 ```
 
-Now send traffic to both and compare. First, the **HPA deployment** — watch the pods scale up:
+**Cloud Run** — watch instances scale up from zero:
+
+```
+# run in Cloud Shell
+export SERVICE_URL=$(gcloud run services describe $SERVICE_NAME --region $REGION --format 'value(status.url)')
+python data_generator/generate_traffic.py --mode load
+```
+
+While it runs, check the Cloud Run metrics in the console — you should see the instance count scale up during bursts and back down during pauses: [Cloud Run](https://console.cloud.google.com/run)
+
+**GKE with HPA** — watch pods scale up:
 
 ```
 # run in Cloud Shell
 export SERVICE_URL=http://$(kubectl get service gourmetgram-service -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
-cd gourmetgram-gcp-lab/
 python data_generator/generate_traffic.py --mode load
 ```
 
@@ -570,7 +502,7 @@ You should see the CPU utilization rise and the replica count increase beyond th
 
 You can also observe this in the Google Cloud Console: [Kubernetes Engine — Workloads](https://console.cloud.google.com/kubernetes/workload). Click on `gourmetgram-deployment` and check the "Observability" tab to see CPU usage and pod count over time.
 
-Next, the **static deployment** — same traffic, but no autoscaler:
+**GKE static** — same traffic, but no autoscaler:
 
 ```
 # run in Cloud Shell
@@ -587,13 +519,76 @@ kubectl get pods -l app=gourmetgram-static --watch
 
 The pod count stays fixed at 2 regardless of load. Under heavy traffic, the existing pods absorb all the requests — there is no scaling. Compare this with what you observed for the HPA deployment, where new pods were created automatically to handle the burst.
 
-We now have three scaling behaviors to compare:
+We now have four scaling behaviors to compare:
 - **VM:** always on, no scaling at all — same cost idle or busy
 - **GKE static:** fixed pods, no scaling — pods may get overwhelmed under load
 - **GKE HPA:** pods scale up with load, scale back down after
 - **Cloud Run:** scales to zero between bursts, scales up during bursts — you only pay for what you use
 
-You can select each service in this [report](https://console.cloud.google.com/billing/01274B-82C9D1-885CD6/reports;timeRange=CUSTOM_RANGE;from=2026-03-28;to=2026-03-31;projects=gourmetgram-gcp-lab;products=services%2F152E-C115-5142?authuser=1&project=gourmetgram-gcp-lab&organizationId=213239977032) to see the cost incurred by each one during this experiment. But you will mostly not be able to see a cost difference yet as it takes some time for the costs to be calculated and reflected in the billing console. You can check back later to see the cost breakdown.
+To compare costs across these deployment options, go to **Billing → Reports** in the Google Cloud Console: [Billing](https://console.cloud.google.com/billing). Select your billing account, click **Reports**, then filter by your project and the relevant services (Compute Engine, Kubernetes Engine, Cloud Run). You can adjust the time range to cover the period of this experiment. Note that billing data may take a few hours to appear — check back later to see the full cost breakdown.
+
+#### Data collection with Cloud Storage
+
+Now that we've measured scaling behavior, let's set up the data pipeline that will feed our retraining workflow. We'll configure Cloud Run to save a copy of every classified image to a GCS bucket — collecting "production" data as the service handles requests.
+
+Set your NYU Net ID and the staging bucket name — the Net ID ensures your bucket name is unique across GCP:
+
+```
+# run in Cloud Shell
+export NET_ID="your-net-id"
+export GCS_STAGING_BUCKET="${NET_ID}-staging-bucket"
+```
+
+Create the staging bucket:
+
+```
+# run in Cloud Shell
+gcloud storage buckets create gs://$GCS_STAGING_BUCKET \
+    --location=us-central1 \
+    --uniform-bucket-level-access
+```
+
+You can verify the bucket was created in the Google Cloud Console: [Cloud Storage](https://console.cloud.google.com/storage/browser)
+
+Run the setup script included in the lab repo. This will download the Food-11 dataset and organize the images into class directories (`class_00/` through `class_10/`):
+
+```
+# run in Cloud Shell
+cd ~/gourmetgram-gcp-lab
+bash data_generator/setup_data.sh
+```
+
+Next, redeploy the GourmetGram service on Cloud Run with the staging bucket configured. This tells the service to save a copy of every incoming image to Cloud Storage as it classifies it:
+
+```
+# run in Cloud Shell
+gcloud run deploy $SERVICE_NAME \
+  --image $REGION-docker.pkg.dev/$GCP_PROJECT_ID/$REPO_NAME/$IMAGE_NAME \
+  --platform managed \
+  --region $REGION \
+  --allow-unauthenticated \
+  --port 8000 \
+  --memory=2Gi \
+  --timeout=600 \
+  --set-env-vars="GCS_STAGING_BUCKET=$GCS_STAGING_BUCKET"
+```
+
+Now generate traffic using `--mode predict`, which sends base64-encoded food images to the `/api/predict` endpoint. The service classifies each image and saves a copy to the GCS staging bucket:
+
+```
+# run in Cloud Shell
+export SERVICE_URL=$(gcloud run services describe $SERVICE_NAME --region $REGION --format 'value(status.url)')
+python data_generator/generate_traffic.py --mode predict
+```
+
+After the generator finishes, check the staging bucket for the captured images:
+
+```
+# run in Cloud Shell
+gsutil ls gs://$GCS_STAGING_BUCKET/incoming/
+```
+
+You should see class directories (`class_00/` through `class_10/`) containing the images the service classified. These are organized by the model's predicted class — simulating how production data would accumulate over time as real users interact with the service. You can also browse the bucket contents in the Google Cloud Console: [Cloud Storage](https://console.cloud.google.com/storage/browser)
 
 #### Event-driven inference with Eventarc
 
@@ -613,7 +608,11 @@ gcloud storage buckets create gs://$GCS_EVENTARC_BUCKET \
     --uniform-bucket-level-access
 ```
 
-Set up the required permissions. Eventarc needs the Cloud Storage service agent to publish events, and a service account to invoke Cloud Run:
+Set up the required permissions. GCP uses **service accounts** to let services act on your behalf — they are identities for programs rather than people. Each GCP service (Cloud Storage, Eventarc, Compute Engine) has its own service agent, and you need to grant these agents the right roles so they can talk to each other. In this case:
+
+- The **GCS service agent** needs permission to publish Pub/Sub messages (so it can notify Eventarc when a file is uploaded)
+- The **default compute service account** needs permission to invoke Cloud Run (so Eventarc can trigger your service)
+- The **Eventarc service agent** needs its operational role to coordinate the event pipeline
 
 ```
 # run in Cloud Shell
@@ -660,14 +659,7 @@ gcloud eventarc triggers describe gourmetgram-eventarc-trigger --location=$REGIO
 
 If this returns a subscription name (e.g. `projects/gourmetgram-gcp-lab/subscriptions/...`), the trigger is ready. If it returns empty, wait and try again.
 
-Now let's test it. The upload mode uses the `google-cloud-storage` Python library, which needs application default credentials. Set those up first:
-
-```
-# run in Cloud Shell
-gcloud auth application-default login
-```
-
-Follow the link to authenticate, then run the generator in `upload` mode:
+Now let's test it. The upload mode uses the `google-cloud-storage` Python library, which needs application default credentials (see [Troubleshooting](#troubleshooting) if you haven't set these up yet). Run the generator in `upload` mode:
 
 ```
 # run in Cloud Shell
@@ -677,7 +669,7 @@ python data_generator/generate_traffic.py --mode upload
 
 The generator uploads images to `gs://<eventarc-bucket>/uploads/`. Each upload triggers Eventarc, which invokes the Cloud Run service. The service downloads the image, classifies it, and saves the result to the staging bucket under `incoming/class_XX/`.
 
-While it runs, you can watch the Cloud Run logs to see the event-driven invocations (if running this in a new Cloud Shell tab, make sure `SERVICE_NAME` is set). Because this is a new Cloud sheel session you also will have to run `gcloud auth login` to authenticate before you can see the logs.:
+While it runs, you can watch the Cloud Run logs to see the event-driven invocations (if running this in a new Cloud Shell tab, make sure `SERVICE_NAME` is set):
 
 ```
 # run in Cloud Shell
@@ -947,17 +939,6 @@ COMPUTE_SA="${PROJECT_NUMBER}-compute@developer.gserviceaccount.com"
 gsutil iam ch serviceAccount:${COMPUTE_SA}:roles/storage.objectAdmin gs://$GCS_TRAINING_BUCKET
 ```
 
-### Authenticate for Vertex AI
-
-The pipeline submission requires application default credentials:
-
-```
-# run in Cloud Shell
-gcloud auth application-default login
-```
-
-Follow the link to authenticate.
-
 ### Install pipeline dependencies
 
 ```
@@ -1116,6 +1097,8 @@ First, make sure your environment variables are still set (if your Cloud Shell s
 # run in Cloud Shell
 export GCP_PROJECT_ID="gourmetgram-gcp-lab"
 export REGION="us-central1"
+export REPO_NAME="gourmetgram-repo"
+export IMAGE_NAME="gourmetgram"
 export SERVICE_NAME="gourmetgram-service"
 
 # IMPORTANT: Change this to your Net ID
@@ -1123,6 +1106,37 @@ export NET_ID="your-net-id"
 
 export GCS_TRAINING_BUCKET="${NET_ID}-training-bucket"
 export GCS_STAGING_BUCKET="${NET_ID}-staging-bucket"
+```
+
+### Update the serving container for Vertex AI
+
+In the next stage we'll deploy models to **Vertex AI Endpoints**. When Vertex AI deploys a model, it mounts the model artifacts from GCS and sets the `AIP_STORAGE_URI` environment variable. Our app needs to load the model from this path instead of the bundled file.
+
+The repo includes a `gourmetgram-vertex/` directory with this change already made. The only difference from the original `gourmetgram/` app is in the model loading section of `app.py`:
+
+```python
+# Vertex AI Endpoints mount model artifacts and set AIP_STORAGE_URI
+# Fall back to bundled model for Cloud Run / GKE deployments
+aip_storage = os.environ.get("AIP_STORAGE_URI", "")
+if aip_storage:
+    model_path = os.path.join(aip_storage, "food11.pth")
+    logging.info(f"Loading model from Vertex AI artifact: {model_path}")
+else:
+    model_path = "food11.pth"
+    logging.info("Loading bundled model: food11.pth")
+```
+
+When deployed on a Vertex AI Endpoint, it loads the trained model from the artifact URI. When deployed on Cloud Run or GKE (where `AIP_STORAGE_URI` is not set), it falls back to the bundled model — so the same image works everywhere.
+
+> **Why rebuild now?** Vertex AI copies the container image internally when a model is registered in Model Registry — it never checks Artifact Registry again after that. By rebuilding the image **before** the pipeline registers models, each Model Registry entry will have the correct Vertex AI-compatible container baked in.
+
+Build and push the updated image using Cloud Build. We use the **same image name** (`gourmetgram`) — existing Cloud Run and GKE deployments are not affected since they continue running the version they were deployed with:
+
+```
+# run in Cloud Shell
+cd ~/gourmetgram-gcp-lab/gourmetgram-vertex
+
+gcloud builds submit --tag $REGION-docker.pkg.dev/$GCP_PROJECT_ID/$REPO_NAME/$IMAGE_NAME .
 ```
 
 ### Create a TensorBoard instance
@@ -1264,40 +1278,7 @@ We'll deploy both in the next stage with traffic splitting to compare their real
 
 So far we've served GourmetGram using Cloud Run and GKE — both are general-purpose hosting platforms. **Vertex AI Endpoints** is purpose-built for ML model serving: it integrates directly with Model Registry, supports **traffic splitting** between model versions (for canary deployments and A/B testing), and provides ML-specific monitoring.
 
-In this stage, we'll deploy our trained models from Model Registry to a Vertex AI Endpoint, then split traffic between two model versions.
-
-### Update the serving container
-
-When Vertex AI Endpoints deploys a model, it mounts the model artifacts from GCS and sets the `AIP_STORAGE_URI` environment variable pointing to them. Our app needs to load the model from this path instead of the bundled file.
-
-The repo includes a `gourmetgram-vertex/` directory with this change already made. The only difference from the original `gourmetgram/` app is in the model loading section of `app.py`:
-
-```python
-# Vertex AI Endpoints mount model artifacts and set AIP_STORAGE_URI
-# Fall back to bundled model for Cloud Run / GKE deployments
-aip_storage = os.environ.get("AIP_STORAGE_URI", "")
-if aip_storage:
-    model_path = os.path.join(aip_storage, "food11.pth")
-    logging.info(f"Loading model from Vertex AI artifact: {model_path}")
-else:
-    model_path = "food11.pth"
-    logging.info("Loading bundled model: food11.pth")
-```
-
-When deployed on a Vertex AI Endpoint, it loads the trained model from the artifact URI. When deployed on Cloud Run or GKE (where `AIP_STORAGE_URI` is not set), it falls back to the bundled model — so the same image works everywhere.
-
-### Rebuild the container image
-
-Build and push the updated image using Cloud Build. We use the **same image name** (`gourmetgram`) so the models already registered in Model Registry automatically pick up this updated container:
-
-```
-# run in Cloud Shell
-cd ~/gourmetgram-gcp-lab/gourmetgram-vertex
-
-gcloud builds submit --tag $REGION-docker.pkg.dev/$GCP_PROJECT_ID/$REPO_NAME/$IMAGE_NAME .
-```
-
-> **Note:** This overwrites the previous `gourmetgram` image in Artifact Registry. Existing Cloud Run and GKE deployments are not affected — they continue running the version they were deployed with. Only new deployments will use this updated image.
+In this stage, we'll deploy our trained models from Model Registry to a Vertex AI Endpoint, then split traffic between two model versions. The container image was already updated in Stage 6 (before model registration), so each model in the Registry already has the correct Vertex AI-compatible container.
 
 ### Create a Vertex AI Endpoint
 
@@ -1418,3 +1399,45 @@ done
 ```
 
 > **Key takeaway:** Vertex AI Endpoints brings ML-specific serving capabilities that general-purpose platforms like Cloud Run don't provide out of the box. Traffic splitting lets you safely roll out new model versions — deploy with 10% traffic, monitor performance, then gradually increase. Combined with Experiment tracking from Stage 6, you have a complete picture: which data and hyperparameters produced which model, and how each model performs in production.
+
+## Troubleshooting
+
+### Authentication errors
+
+Cloud Shell sessions expire periodically. If you encounter errors like "no active account", "permission denied", or "unauthenticated", re-authenticate:
+
+```
+# Re-authenticate gcloud CLI (fixes most gcloud command errors)
+gcloud auth login
+```
+
+Some tools (the Python traffic generator, Vertex AI pipeline submission) use **application default credentials** instead of gcloud's own credentials. If you see errors from Python scripts about credentials or authentication:
+
+```
+# Set application default credentials (fixes Python SDK errors)
+gcloud auth application-default login
+```
+
+Both commands will give you a link to open in your browser. Follow it to authenticate, then return to Cloud Shell.
+
+### Cloud Shell session restarts
+
+If your Cloud Shell session restarts, all environment variables are lost. Re-export them by running the variable block at the top of whichever section you're working on. You may also need to re-run `gcloud container clusters get-credentials` for GKE access and re-authenticate as described above.
+
+### Docker push "connection refused"
+
+If `docker push` to Artifact Registry fails with a "connection refused" error in Cloud Shell, use Cloud Build as a workaround instead:
+
+```
+gcloud builds submit --tag $REGION-docker.pkg.dev/$GCP_PROJECT_ID/$REPO_NAME/$IMAGE_NAME .
+```
+
+### gcloud builds submit log crash
+
+If `gcloud builds submit` crashes with a Python error while tailing logs (a known gcloud SDK bug), the build itself usually succeeds. Use `--async` to skip log tailing:
+
+```
+gcloud builds submit --async --tag $REGION-docker.pkg.dev/$GCP_PROJECT_ID/$REPO_NAME/$IMAGE_NAME .
+```
+
+Check the build status in the console: [Cloud Build](https://console.cloud.google.com/cloud-build/builds)
