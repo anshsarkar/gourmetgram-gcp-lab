@@ -16,6 +16,7 @@ from kfp.dsl import Dataset, Input, Model, Output
 def prepare_data(
     training_bucket: str,
     collated_dataset: Output[Dataset],
+    retrain: bool = False,
 ):
     """Collate untrained dataset versions and split into train/val (80/20)."""
     import json
@@ -28,21 +29,45 @@ def prepare_data(
     logger = logging.getLogger(__name__)
 
     try:
-        logger.info(f"=== prepare_data started. Bucket: {training_bucket} ===")
+        logger.info(f"=== prepare_data started. Bucket: {training_bucket}, retrain={retrain} ===")
 
         client = storage.Client()
         bucket = client.bucket(training_bucket)
 
-        # Read training metadata to find last trained version
+        # Read training metadata
         metadata_blob = bucket.blob("training_metadata.json")
         if metadata_blob.exists():
             metadata = json.loads(metadata_blob.download_as_text())
-            last_trained = metadata.get("last_trained_version", 0)
-            logger.info(f"Found training metadata. Last trained version: v{last_trained}")
         else:
             metadata = {}
-            last_trained = 0
-            logger.info("No training metadata found. Will process all versions.")
+
+        # Retrain mode: reuse existing collated data from the previous run
+        if retrain:
+            prev_versions = metadata.get("trained_on_data_versions", [])
+            if not prev_versions:
+                logger.info("Retrain requested but no previous training found. Exiting.")
+                collated_dataset.metadata["versions_collated"] = []
+                collated_dataset.metadata["total_images"] = 0
+                return
+
+            # Count existing collated images
+            train_blobs = [b for b in bucket.list_blobs(prefix="collated/training/") if b.name.lower().endswith((".jpg", ".jpeg", ".png"))]
+            val_blobs = [b for b in bucket.list_blobs(prefix="collated/validation/") if b.name.lower().endswith((".jpg", ".jpeg", ".png"))]
+            total = len(train_blobs) + len(val_blobs)
+
+            logger.info(f"Retrain mode: reusing existing collated data from versions {prev_versions}")
+            logger.info(f"  {len(train_blobs)} training, {len(val_blobs)} validation images")
+
+            collated_dataset.metadata["versions_collated"] = prev_versions
+            collated_dataset.metadata["total_images"] = total
+            collated_dataset.metadata["train_count"] = len(train_blobs)
+            collated_dataset.metadata["val_count"] = len(val_blobs)
+            collated_dataset.metadata["gcs_path"] = f"gs://{training_bucket}/collated"
+            collated_dataset.uri = f"gs://{training_bucket}/collated"
+            return
+
+        last_trained = metadata.get("last_trained_version", 0)
+        logger.info(f"Last trained version: v{last_trained}")
 
         # Find all dataset versions
         blobs = bucket.list_blobs(prefix="datasets/Food-11/v", delimiter="/")
@@ -154,6 +179,7 @@ def train_model(
     tensorboard_id: str = "",
     gcp_project: str = "",
     gcp_location: str = "us-central1",
+    retrain: bool = False,
 ):
     """Train or fine-tune MobileNetV2 on the collated dataset."""
     import json
@@ -257,16 +283,20 @@ def train_model(
         if metadata_blob.exists():
             metadata = json.loads(metadata_blob.download_as_text())
             last_model_version = metadata.get("last_model_version", 0)
-            if last_model_version > 0:
-                model_path = f"models/model_v{last_model_version}/food11.pth"
+
+            # Retrain: load the same base model as the previous run (N-1), not the latest (N)
+            base_version = last_model_version - 1 if retrain else last_model_version
+
+            if base_version > 0:
+                model_path = f"models/model_v{base_version}/food11.pth"
                 model_blob = bucket.blob(model_path)
                 if model_blob.exists():
-                    logger.info(f"Loading existing model: model_v{last_model_version} for fine-tuning")
+                    logger.info(f"Loading model_v{base_version} as base for {'retrain' if retrain else 'fine-tuning'}")
                     local_model = "/tmp/food11_prev.pth"
                     model_blob.download_to_filename(local_model)
                     state = torch.load(local_model, map_location=device)
                     model.load_state_dict(state)
-                    logger.info("Previous model weights loaded successfully.")
+                    logger.info("Base model weights loaded successfully.")
                 else:
                     logger.info(f"Model file not found at {model_path}. Training from scratch.")
         else:
@@ -278,7 +308,13 @@ def train_model(
         logger.info(f"Model parameters: {total_params:,}")
 
         # --- Experiment tracking (optional) ---
-        new_model_version = metadata.get("last_model_version", 0) + 1
+        # Retrain keeps the same version number (it's an alternative, not a new version)
+        if retrain:
+            new_model_version = metadata.get("last_model_version", 0)
+        else:
+            new_model_version = metadata.get("last_model_version", 0) + 1
+        retrain_suffix = f"-{time.strftime('%Y%m%d-%H%M%S')}" if retrain else ""
+
         tracking = bool(experiment_name)
         if tracking:
             from google.cloud import aiplatform
@@ -289,7 +325,8 @@ def train_model(
                 experiment=experiment_name,
                 experiment_tensorboard=tensorboard_id if tensorboard_id else None,
             )
-            aiplatform.start_run(f"train-v{new_model_version}")
+            run_name = f"v{new_model_version}-retrain{retrain_suffix}" if retrain else f"train-v{new_model_version}"
+            aiplatform.start_run(run_name)
             aiplatform.log_params({
                 "initial_epochs": initial_epochs,
                 "total_epochs": total_epochs,
@@ -439,35 +476,51 @@ def train_model(
                 logger.info("  Early stopping triggered.")
                 break
 
-        # --- Upload trained model to GCS ---
-        logger.info("=" * 60)
-        logger.info("Uploading trained model to GCS")
+        # --- Upload trained model ---
         logger.info("=" * 60)
         last_model_version = new_model_version
 
-        # Versioned model
-        versioned_path = f"models/model_v{last_model_version}/food11.pth"
-        bucket.blob(versioned_path).upload_from_filename(best_model_path)
-        logger.info(f"Versioned model saved: gs://{training_bucket}/{versioned_path}")
+        if retrain:
+            # Retrain: no production model save — only experiment tracking + Model Registry
+            # Upload to a timestamped GCS path solely for Model Registry artifact reference
+            retrain_label = f"v{last_model_version}-retrain{retrain_suffix}"
+            retrain_gcs_path = f"retrain-artifacts/{retrain_label}/food11.pth"
+            bucket.blob(retrain_gcs_path).upload_from_filename(best_model_path)
+            logger.info(f"Retrain artifact: gs://{training_bucket}/{retrain_gcs_path}")
+            model_artifact_uri = f"gs://{training_bucket}/retrain-artifacts/{retrain_label}"
+            registry_display_name = f"gourmetgram-{retrain_label}"
+            # Don't update training_metadata.json — retrain doesn't affect production lineage
+        else:
+            logger.info("Uploading trained model to GCS")
+            logger.info("=" * 60)
 
-        # Latest model
-        bucket.blob("models/latest/food11.pth").upload_from_filename(best_model_path)
-        logger.info(f"Latest model updated: gs://{training_bucket}/models/latest/food11.pth")
+            # Versioned model
+            versioned_path = f"models/model_v{last_model_version}/food11.pth"
+            bucket.blob(versioned_path).upload_from_filename(best_model_path)
+            logger.info(f"Versioned model saved: gs://{training_bucket}/{versioned_path}")
 
-        # Update training metadata
-        max_version = max(versions_collated)
-        metadata["last_trained_version"] = max_version
-        metadata["last_model_version"] = last_model_version
-        metadata["trained_on_data_versions"] = versions_collated
+            # Latest model
+            bucket.blob("models/latest/food11.pth").upload_from_filename(best_model_path)
+            logger.info(f"Latest model updated: gs://{training_bucket}/models/latest/food11.pth")
 
-        metadata_blob.upload_from_string(
-            json.dumps(metadata, indent=2), content_type="application/json"
-        )
-        logger.info(f"Training metadata updated: last_trained_version=v{max_version}, model=model_v{last_model_version}")
+            model_artifact_uri = f"gs://{training_bucket}/models/model_v{last_model_version}"
+            registry_display_name = f"gourmetgram-model-v{last_model_version}"
 
-        trained_model.uri = f"gs://{training_bucket}/{versioned_path}"
+            # Update training metadata
+            max_version = max(versions_collated)
+            metadata["last_trained_version"] = max_version
+            metadata["last_model_version"] = last_model_version
+            metadata["trained_on_data_versions"] = versions_collated
+
+            metadata_blob.upload_from_string(
+                json.dumps(metadata, indent=2), content_type="application/json"
+            )
+            logger.info(f"Training metadata updated: last_trained_version=v{max_version}, model=model_v{last_model_version}")
+
+        trained_model.uri = model_artifact_uri
         trained_model.metadata["model_version"] = last_model_version
         trained_model.metadata["data_versions"] = versions_collated
+        trained_model.metadata["is_retrain"] = retrain
 
         logger.info(f"Best validation loss: {best_val_loss:.4f}")
 
@@ -481,11 +534,11 @@ def train_model(
             })
 
             # Register model in Vertex AI Model Registry
-            logger.info("Registering model in Vertex AI Model Registry...")
+            logger.info(f"Registering model as '{registry_display_name}' in Model Registry...")
             container_uri = f"{gcp_location}-docker.pkg.dev/{gcp_project}/gourmetgram-repo/gourmetgram"
             aiplatform.Model.upload(
-                display_name=f"gourmetgram-model-v{last_model_version}",
-                artifact_uri=f"gs://{training_bucket}/models/model_v{last_model_version}",
+                display_name=registry_display_name,
+                artifact_uri=model_artifact_uri,
                 serving_container_image_uri=container_uri,
                 serving_container_predict_route="/api/predict",
                 serving_container_health_route="/test",
@@ -523,8 +576,9 @@ def gourmetgram_training_pipeline(
     fine_tune_lr: float = 1e-5,
     experiment_name: str = "",
     tensorboard_id: str = "",
+    retrain: bool = False,
 ):
-    data_task = prepare_data(training_bucket=training_bucket)
+    data_task = prepare_data(training_bucket=training_bucket, retrain=retrain)
     data_task.set_caching_options(False)
 
     custom_train_job = create_custom_training_job_from_component(
@@ -546,6 +600,7 @@ def gourmetgram_training_pipeline(
         fine_tune_lr=fine_tune_lr,
         experiment_name=experiment_name,
         tensorboard_id=tensorboard_id,
+        retrain=retrain,
         gcp_project=project,
         gcp_location=location,
         project=project,
@@ -573,6 +628,8 @@ if __name__ == "__main__":
                         help="Vertex AI experiment name (enables tracking if set)")
     parser.add_argument("--tensorboard-id", default="",
                         help="Vertex AI TensorBoard resource ID (full path)")
+    parser.add_argument("--retrain", action="store_true",
+                        help="Retrain on same data with same base model (for hyperparameter comparison)")
     args = parser.parse_args()
 
     # Step 1: Compile pipeline to YAML template
@@ -612,6 +669,7 @@ if __name__ == "__main__":
             "fine_tune_lr": args.fine_tune_lr,
             "experiment_name": args.experiment_name,
             "tensorboard_id": args.tensorboard_id,
+            "retrain": args.retrain,
         },
     )
 
