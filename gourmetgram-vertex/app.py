@@ -97,20 +97,23 @@ def upload():
 @app.route('/api/predict', methods=['POST'])
 def api_predict():
     data = request.get_json()
+    data = request.get_json(force=True, silent=True)
     if not data:
-        return jsonify({"error": "no JSON body"}), 400
+        return jsonify({"error": "no JSON body", "content_type": request.content_type, "body_length": request.content_length}), 400
+
+    logging.info(f"/api/predict received keys: {list(data.keys())}")
 
     # Vertex AI Endpoints wraps requests: {"instances": [{"image": "..."}]}
     vertex_format = 'instances' in data
     if vertex_format:
         instance = data['instances'][0]
         if 'image' not in instance:
-            return jsonify({"error": "missing 'image' field"}), 400
+            return jsonify({"error": "missing 'image' in instance", "instance_keys": list(instance.keys())}), 400
         img_bytes = base64.b64decode(instance['image'])
     elif 'image' in data:
         img_bytes = base64.b64decode(data['image'])
     else:
-        return jsonify({"error": "missing 'image' field"}), 400
+        return jsonify({"error": "missing 'image' field", "received_keys": list(data.keys())}), 400
 
     img = Image.open(io.BytesIO(img_bytes)).convert('RGB')
     temp_path = os.path.join(app.instance_path, 'uploads', f"{uuid.uuid4().hex}.jpg")
