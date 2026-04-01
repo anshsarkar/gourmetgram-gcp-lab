@@ -87,14 +87,36 @@ echo "[12/14] Deleting Vertex AI Experiments..."
 gcloud ai experiments delete gourmetgram-experiment --region=$REGION --quiet 2>/dev/null || echo "  (not found, skipping)"
 
 # --- Artifact Registry Images ---
-echo "[13/14] Deleting Artifact Registry images..."
+echo "[13/17] Deleting Artifact Registry images..."
 gcloud artifacts docker images delete $REGION-docker.pkg.dev/$GCP_PROJECT_ID/gourmetgram-repo/gourmetgram --delete-tags --quiet 2>/dev/null || echo "  gourmetgram image not found, skipping"
 gcloud artifacts docker images delete $REGION-docker.pkg.dev/$GCP_PROJECT_ID/gourmetgram-repo/batch-data-job --delete-tags --quiet 2>/dev/null || echo "  batch-data-job image not found, skipping"
 gcloud artifacts docker images delete $REGION-docker.pkg.dev/$GCP_PROJECT_ID/gourmetgram-repo/gourmetgram-training --delete-tags --quiet 2>/dev/null || echo "  gourmetgram-training image not found, skipping"
 
 # --- Artifact Registry Repo ---
-echo "[14/14] Deleting Artifact Registry repository..."
+echo "[14/17] Deleting Artifact Registry repository..."
 gcloud artifacts repositories delete gourmetgram-repo --location=$REGION --quiet 2>/dev/null || echo "  (not found, skipping)"
+
+# --- Monitoring Dashboard ---
+echo "[15/17] Deleting monitoring dashboard..."
+DASHBOARD_ID=$(gcloud monitoring dashboards list --format="value(name)" --filter="displayName='GourmetGram Overview'" 2>/dev/null | head -1)
+if [ -n "$DASHBOARD_ID" ]; then
+  gcloud monitoring dashboards delete "$DASHBOARD_ID" --quiet 2>/dev/null || true
+else
+  echo "  (not found, skipping)"
+fi
+
+# --- Alerting Policy ---
+echo "[16/17] Deleting alerting policy..."
+POLICY_ID=$(gcloud alpha monitoring policies list --format="value(name)" --filter="displayName='GourmetGram High Latency Alert'" 2>/dev/null | head -1)
+if [ -n "$POLICY_ID" ]; then
+  gcloud alpha monitoring policies delete "$POLICY_ID" --quiet 2>/dev/null || true
+else
+  echo "  (not found, skipping)"
+fi
+
+# --- Log-based Metric ---
+echo "[17/17] Deleting log-based metric..."
+gcloud logging metrics delete prediction_request_count --quiet 2>/dev/null || echo "  (not found, skipping)"
 
 echo ""
 echo "=== Cleanup complete ==="
