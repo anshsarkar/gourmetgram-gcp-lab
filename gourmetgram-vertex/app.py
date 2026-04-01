@@ -43,7 +43,18 @@ model.classifier = torch.nn.Sequential(
     torch.nn.Dropout(0.5),
     torch.nn.Linear(num_ftrs, 11)
 )
-state = torch.load("food11.pth", map_location=torch.device('cpu'))
+
+# Vertex AI Endpoints mount model artifacts and set AIP_STORAGE_URI
+# Fall back to bundled model for Cloud Run / GKE deployments
+aip_storage = os.environ.get("AIP_STORAGE_URI", "")
+if aip_storage:
+    model_path = os.path.join(aip_storage, "food11.pth")
+    logging.info(f"Loading model from Vertex AI artifact: {model_path}")
+else:
+    model_path = "food11.pth"
+    logging.info("Loading bundled model: food11.pth")
+
+state = torch.load(model_path, map_location=torch.device('cpu'))
 model.load_state_dict(state)
 model.eval()
 
