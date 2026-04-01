@@ -99,7 +99,6 @@ def api_predict():
 
 @app.route('/event', methods=['POST'])
 def handle_event():
-    """Handle Eventarc GCS trigger — classify an uploaded image and save to staging bucket."""
     envelope = request.get_json()
     if not envelope or 'bucket' not in envelope or 'name' not in envelope:
         return jsonify({"error": "invalid event payload"}), 400
