@@ -650,7 +650,7 @@ gcloud eventarc triggers create gourmetgram-eventarc-trigger \
   --service-account="${COMPUTE_SA}"
 ```
 
-It may take a minute or two for the trigger to become fully active. You can check its status:
+It may take a minute or two for the trigger to become fully active. If this fails saying that it will take sometime to propagate the access policies, then just wait for 2-3 minutes and try again. After it runs successfully, you can check its status:
 
 ```
 # run in Cloud Shell
@@ -690,6 +690,8 @@ Notice that the result is the same as Option A (direct API) — classified image
 You can browse the staging bucket to see the newly classified images: [Cloud Storage](https://console.cloud.google.com/storage/browser). You can also check the Cloud Run metrics to see that inference requests were triggered by Eventarc — look at the request count and instance count in the "Metrics" tab: [Cloud Run](https://console.cloud.google.com/run)
 
 > **Note:** The upload mode is slower than the direct API mode since each image goes through GCS first, then Eventarc, then Cloud Run. You can interrupt the generator with `Ctrl+C` once you've confirmed the flow works — the goal here is to see event-driven scaling in action, not to wait for all 1200 uploads to complete.
+
+> **Why might I see more images than expected?** If you ran both `--mode predict` (1200 requests) and `--mode upload` (1200 uploads), you might expect ~2400 images in the staging bucket — but you'll likely see more. This is because Eventarc uses **at-least-once delivery**: under load, some events may be delivered and processed more than once, resulting in duplicate images. This is a fundamental trade-off in event-driven systems — at-least-once delivery is reliable (no events are lost) but requires deduplication if exactness matters. For our use case, a few extra training images don't hurt.
 
 #### Cost comparison
 
@@ -771,6 +773,7 @@ Now create the Cloud Run Job:
 gcloud run jobs create batch-data-job \
   --image=$REGION-docker.pkg.dev/$GCP_PROJECT_ID/gourmetgram-repo/batch-data-job \
   --region=$REGION \
+  --max-retries=0 \
   --set-env-vars="GCS_STAGING_BUCKET=$GCS_STAGING_BUCKET,GCS_TRAINING_BUCKET=$GCS_TRAINING_BUCKET"
 ```
 
@@ -816,13 +819,13 @@ This should be empty — the batch job moved all images to the training bucket a
 
 In production, this batch job would run on a regular schedule (daily, weekly) to automatically version new data as it arrives. Let's set up Cloud Scheduler to demonstrate this pattern.
 
-> **Note:** We're using a 5-minute interval for the lab so you can see it trigger within the session. In production, this would typically be a daily or weekly schedule depending on data volume.
+> **Note:** We're using a 10-minute interval for the lab so you can see it trigger within the session. In production, this would typically be a daily or weekly schedule depending on data volume.
 
 ```
 # run in Cloud Shell
 gcloud scheduler jobs create http batch-data-scheduler \
   --location=$REGION \
-  --schedule="*/5 * * * *" \
+  --schedule="*/10 * * * *" \
   --uri="https://$REGION-run.googleapis.com/apis/run.googleapis.com/v1/namespaces/$GCP_PROJECT_ID/jobs/batch-data-job:run" \
   --http-method=POST \
   --oauth-service-account-email=${COMPUTE_SA}
@@ -1389,7 +1392,7 @@ Send multiple prediction requests and observe that responses may come from diffe
 
 ```
 # run in Cloud Shell
-for i in $(seq 1 10); do
+for i in $(seq 1 20); do
   curl -s -X POST \
     -H "Authorization: Bearer $(gcloud auth print-access-token)" \
     -H "Content-Type: application/json" \
@@ -1398,7 +1401,342 @@ for i in $(seq 1 10); do
 done
 ```
 
+You should see that some responses come from the production model and some from the retrain model, according to the 70/30 split. This split is also visible in the endpoint details in the console. The ```Inferences/second``` tab shws the traffic distribution between the two models in real time.
+
 > **Key takeaway:** Vertex AI Endpoints brings ML-specific serving capabilities that general-purpose platforms like Cloud Run don't provide out of the box. Traffic splitting lets you safely roll out new model versions — deploy with 10% traffic, monitor performance, then gradually increase. Combined with Experiment tracking from Stage 6, you have a complete picture: which data and hyperparameters produced which model, and how each model performs in production.
+
+## Stage 8: Cloud Monitoring + Logging
+
+Throughout this lab we've deployed services, generated traffic, trained models, and served predictions. But in production, you need to know what's happening — is the service healthy? How is it scaling? What predictions are being made? In this final stage, we set up observability across the pipeline using Cloud Logging and Cloud Monitoring.
+
+Make sure your environment variables are set:
+
+```
+# run in Cloud Shell
+export GCP_PROJECT_ID="gourmetgram-gcp-lab"
+export REGION="us-central1"
+export SERVICE_NAME="gourmetgram-service"
+```
+
+### Query Cloud Run logs
+
+Cloud Logging automatically captures logs from Cloud Run. Let's query the prediction logs from our service — every time the app handled a `/api/predict` request, it logged the result.
+
+```
+# run in Cloud Shell
+gcloud logging read "resource.type=cloud_run_revision AND resource.labels.service_name=$SERVICE_NAME AND textPayload:api/predict" \
+  --limit=20 \
+  --format="table(timestamp, textPayload)" \
+  --freshness=7d
+```
+
+You can also view these interactively in the console: [Logs Explorer](https://console.cloud.google.com/logs/query). Make sure that the time range is set for a value which is more than "Last 1 hour". In the Logs Explorer, try this query:
+
+```
+resource.type="cloud_run_revision"
+resource.labels.service_name="gourmetgram-service"
+textPayload:"api/predict"
+```
+
+You should see log entries showing the food class predictions your service made during the traffic generation steps.
+
+### Create a log-based metric
+
+Log-based metrics let you turn log entries into time-series data that can be charted and alerted on. We'll create a metric that counts how many prediction requests Cloud Run has handled:
+
+```
+# run in Cloud Shell
+gcloud logging metrics create prediction_request_count \
+  --description="Count of prediction requests handled by GourmetGram Cloud Run service" \
+  --log-filter='resource.type="cloud_run_revision" AND resource.labels.service_name="gourmetgram-service" AND textPayload:"api/predict"'
+```
+
+
+You can see the metric in the console: [Log-based Metrics](https://console.cloud.google.com/logs/metrics)
+
+> **Note:** Log-based metrics only count new log entries that arrive after the metric is created. To see data, you'll need to generate some traffic after this step (we'll do that shortly).
+
+### Query Vertex AI Endpoint logs
+
+If you deployed models to a Vertex AI Endpoint in Stage 7, those predictions are also logged:
+
+```
+# run in Cloud Shell
+gcloud logging read "resource.type=aiplatform.googleapis.com/Endpoint" \
+  --limit=10 \
+  --format="table(timestamp, jsonPayload.type_url)" \
+  --freshness=7d
+```
+
+Or in the Logs Explorer:
+
+```
+resource.type="aiplatform.googleapis.com/Endpoint"
+```
+
+### Create a monitoring dashboard
+
+Now let's create a Cloud Monitoring dashboard that shows key metrics across our services. We'll create a dashboard configuration and deploy it:
+
+```
+# run in Cloud Shell
+cat > /tmp/dashboard.json << 'ENDJSON'
+{
+  "displayName": "GourmetGram Overview",
+  "mosaicLayout": {
+    "columns": 12,
+    "tiles": [
+      {
+        "width": 6,
+        "height": 4,
+        "widget": {
+          "title": "Cloud Run — Request Count",
+          "xyChart": {
+            "dataSets": [{
+              "timeSeriesQuery": {
+                "timeSeriesFilter": {
+                  "filter": "resource.type=\"cloud_run_revision\" AND metric.type=\"run.googleapis.com/request_count\"",
+                  "aggregation": {
+                    "alignmentPeriod": "60s",
+                    "perSeriesAligner": "ALIGN_RATE"
+                  }
+                }
+              }
+            }]
+          }
+        }
+      },
+      {
+        "xPos": 6,
+        "width": 6,
+        "height": 4,
+        "widget": {
+          "title": "Cloud Run — Request Latency (p50 / p95 / p99)",
+          "xyChart": {
+            "dataSets": [{
+              "timeSeriesQuery": {
+                "timeSeriesFilter": {
+                  "filter": "resource.type=\"cloud_run_revision\" AND metric.type=\"run.googleapis.com/request_latencies\"",
+                  "aggregation": {
+                    "alignmentPeriod": "60s",
+                    "perSeriesAligner": "ALIGN_PERCENTILE_99"
+                  }
+                }
+              }
+            }]
+          }
+        }
+      },
+      {
+        "yPos": 4,
+        "width": 6,
+        "height": 4,
+        "widget": {
+          "title": "Cloud Run — Container Instance Count",
+          "xyChart": {
+            "dataSets": [{
+              "timeSeriesQuery": {
+                "timeSeriesFilter": {
+                  "filter": "resource.type=\"cloud_run_revision\" AND metric.type=\"run.googleapis.com/container/instance_count\"",
+                  "aggregation": {
+                    "alignmentPeriod": "60s",
+                    "perSeriesAligner": "ALIGN_MEAN"
+                  }
+                }
+              }
+            }]
+          }
+        }
+      },
+      {
+        "xPos": 6,
+        "yPos": 4,
+        "width": 6,
+        "height": 4,
+        "widget": {
+          "title": "Cloud Run — CPU and Memory Utilization",
+          "xyChart": {
+            "dataSets": [{
+              "timeSeriesQuery": {
+                "timeSeriesFilter": {
+                  "filter": "resource.type=\"cloud_run_revision\" AND metric.type=\"run.googleapis.com/container/cpu/utilizations\"",
+                  "aggregation": {
+                    "alignmentPeriod": "60s",
+                    "perSeriesAligner": "ALIGN_PERCENTILE_99"
+                  }
+                }
+              }
+            }]
+          }
+        }
+      },
+      {
+        "yPos": 8,
+        "width": 6,
+        "height": 4,
+        "widget": {
+          "title": "GKE — Pod Count",
+          "xyChart": {
+            "dataSets": [{
+              "timeSeriesQuery": {
+                "timeSeriesFilter": {
+                  "filter": "resource.type=\"k8s_container\" AND metric.type=\"kubernetes.io/container/restart_count\"",
+                  "aggregation": {
+                    "alignmentPeriod": "60s",
+                    "perSeriesAligner": "ALIGN_RATE"
+                  }
+                }
+              }
+            }]
+          }
+        }
+      },
+      {
+        "xPos": 6,
+        "yPos": 8,
+        "width": 6,
+        "height": 4,
+        "widget": {
+          "title": "Prediction Request Count (log-based)",
+          "xyChart": {
+            "dataSets": [{
+              "timeSeriesQuery": {
+                "timeSeriesFilter": {
+                  "filter": "metric.type=\"logging.googleapis.com/user/prediction_request_count\"",
+                  "aggregation": {
+                    "alignmentPeriod": "60s",
+                    "perSeriesAligner": "ALIGN_RATE"
+                  }
+                }
+              }
+            }]
+          }
+        }
+      }
+    ]
+  }
+}
+ENDJSON
+
+gcloud monitoring dashboards create --config-from-file=/tmp/dashboard.json
+```
+
+View your dashboard in the console: [Monitoring Dashboards](https://console.cloud.google.com/monitoring/dashboards)
+
+Click on **GourmetGram Overview** to see the charts. If you completed the traffic generation steps earlier, you should see request counts, latency distributions, and instance scaling patterns.
+
+### Generate traffic to populate the dashboard
+
+If the charts look empty (the log-based metric only captures new data), send a quick burst of traffic to Cloud Run:
+
+```
+# run in Cloud Shell
+export CLOUD_RUN_URL=$(gcloud run services describe $SERVICE_NAME --region $REGION --format 'value(status.url)')
+
+for i in $(seq 1 20); do
+  curl -s -o /dev/null -w "Request $i: %{http_code} (%{time_total}s)\n" $CLOUD_RUN_URL/test
+done
+```
+
+Wait a minute or two, then refresh the dashboard. It will be easier for this step if you set the time range to be "Last 15 minutes" and also enable auto-refresh. You should now see the request spike in the charts.
+
+### Set up an alerting policy
+
+Let's create an alert that fires when Cloud Run request latency exceeds 5 seconds — this would indicate the service is struggling:
+
+```
+# run in Cloud Shell
+gcloud alpha monitoring policies create \
+  --display-name="GourmetGram High Latency Alert" \
+  --condition-display-name="Cloud Run p99 latency > 5s" \
+  --condition-filter='resource.type="cloud_run_revision" AND metric.type="run.googleapis.com/request_latencies"' \
+  --condition-threshold-value=5000 \
+  --condition-threshold-comparison=COMPARISON_GT \
+  --condition-threshold-duration=60s \
+  --condition-threshold-aggregation='{"alignmentPeriod":"60s","perSeriesAligner":"ALIGN_PERCENTILE_99"}' \
+  --notification-channels=[] \
+  --combiner=OR
+```
+
+> **Note:** We're creating this alert without a notification channel (no email/SMS), so it will only show in the console. In production, you'd connect it to an email, Slack, or PagerDuty notification channel.
+
+View your alerting policy: [Monitoring Alerting](https://console.cloud.google.com/monitoring/alerting)
+
+> **Key takeaway:** Cloud Monitoring and Logging give you visibility into your entire ML pipeline. Log-based metrics let you bridge application-level events (like predictions) into the monitoring system. Custom dashboards give you a single pane of glass across Cloud Run, GKE, and Vertex AI. Alerting policies ensure you're notified when something goes wrong — a critical requirement for production ML systems.
+
+## Cost comparison
+
+Throughout this lab, we've had several compute options running simultaneously. Let's compare their costs.
+
+Go to **Billing** in the Google Cloud Console. Navigate to your billing account, then click **Reports** in the left sidebar. Filter by your project (`gourmetgram-gcp-lab`) and set the time range to cover the duration of this lab.
+
+You can also see resource-level costs in the [Cost Table](https://console.cloud.google.com/billing) view — click **Cost Table** in the left sidebar to see line items broken down by service.
+
+Here's what to look for:
+
+| Deployment | Behavior during this lab | Cost pattern |
+|---|---|---|
+| **Compute Engine VM** | Ran idle the entire time (deployed in synthetic traffic section) | Charged continuously — even though it did nothing |
+| **GKE static deployment** | Fixed pods running, regardless of traffic | Cluster + node costs the entire time |
+| **GKE with HPA** | Pods scaled up during load, back down after | Same cluster cost, but fewer pods during idle |
+| **Cloud Run** | Scaled to zero between traffic bursts | Only charged during the seconds when requests were being processed |
+| **Vertex AI Endpoint** | Dedicated machine running for model serving | Charged from deploy time — similar to VM for single-model serving |
+
+The key insight: **serverless (Cloud Run) is dramatically cheaper for intermittent workloads** because you only pay for what you use. Always-on resources (VM, static K8s) accumulate cost whether they're serving traffic or sitting idle. For ML inference that has variable traffic, this cost difference compounds quickly.
+
+> **Note:** Your actual costs will depend on how long each resource was running and how much traffic you generated. The pattern — not the exact numbers — is what matters.
+
+## Cleanup
+
+To avoid ongoing charges, delete all the resources created during this lab. A cleanup script is included in the repo:
+
+```
+# run in Cloud Shell
+cd ~/gourmetgram-gcp-lab
+bash cleanup.sh
+```
+
+> **Important:** Before running the cleanup script, edit `cleanup.sh` and change the `NET_ID` variable to your own Net ID.
+
+The script deletes resources in dependency order:
+
+1. Cloud Scheduler job
+2. Cloud Run Job (batch data)
+3. Eventarc trigger
+4. Cloud Run service
+5. Compute Engine VM + firewall rule
+6. GKE cluster
+7. GCS buckets (staging, training, eventarc)
+8. Vertex AI Endpoint (undeploys all models first)
+9. Vertex AI Models
+10. Vertex AI TensorBoard instances
+11. Vertex AI Experiments
+12. Artifact Registry images + repository
+13. Monitoring dashboard and alerting policy
+
+After the script completes, verify in the console that all resources are deleted: [Cloud Console Dashboard](https://console.cloud.google.com/home/dashboard)
+
+To also delete the monitoring resources created in Stage 8:
+
+```
+# run in Cloud Shell
+# Delete the dashboard
+DASHBOARD_ID=$(gcloud monitoring dashboards list --format="value(name)" --filter="displayName='GourmetGram Overview'" | head -1)
+if [ -n "$DASHBOARD_ID" ]; then
+  gcloud monitoring dashboards delete "$DASHBOARD_ID"
+fi
+
+# Delete the alerting policy
+POLICY_ID=$(gcloud alpha monitoring policies list --format="value(name)" --filter="displayName='GourmetGram High Latency Alert'" | head -1)
+if [ -n "$POLICY_ID" ]; then
+  gcloud alpha monitoring policies delete "$POLICY_ID"
+fi
+
+# Delete the log-based metric
+gcloud logging metrics delete prediction_request_count --quiet
+```
+
+> **Tip:** If you're done with the project entirely, you can delete the entire GCP project, which immediately stops all billing: **IAM & Admin → Settings → Shut down project**.
 
 ## Troubleshooting
 
