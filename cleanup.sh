@@ -24,41 +24,41 @@ echo "Net ID:  $NET_ID"
 echo ""
 
 # --- Cloud Scheduler ---
-echo "[1/10] Deleting Cloud Scheduler job..."
+echo "[1/17] Deleting Cloud Scheduler job..."
 gcloud scheduler jobs delete batch-data-scheduler --location=$REGION --quiet 2>/dev/null || echo "  (not found, skipping)"
 
 # --- Cloud Run Job ---
-echo "[2/10] Deleting Cloud Run Job..."
+echo "[2/17] Deleting Cloud Run Job..."
 gcloud run jobs delete batch-data-job --region=$REGION --quiet 2>/dev/null || echo "  (not found, skipping)"
 
 # --- Eventarc Trigger ---
-echo "[3/10] Deleting Eventarc trigger..."
+echo "[3/17] Deleting Eventarc trigger..."
 gcloud eventarc triggers delete gourmetgram-eventarc-trigger --location=$REGION --quiet 2>/dev/null || echo "  (not found, skipping)"
 
 # --- Cloud Run Service ---
-echo "[4/10] Deleting Cloud Run service..."
+echo "[4/17] Deleting Cloud Run service..."
 gcloud run services delete $SERVICE_NAME --region=$REGION --quiet 2>/dev/null || echo "  (not found, skipping)"
 
 # --- VM Instance ---
-echo "[5/10] Deleting VM instance..."
+echo "[5/17] Deleting VM instance..."
 gcloud compute instances delete gourmetgram-vm --zone=$ZONE --quiet 2>/dev/null || echo "  (not found, skipping)"
 
 # --- Firewall Rule ---
-echo "[6/10] Deleting firewall rule..."
+echo "[6/17] Deleting firewall rule..."
 gcloud compute firewall-rules delete allow-gourmetgram-vm --quiet 2>/dev/null || echo "  (not found, skipping)"
 
 # --- GKE Cluster (takes a few minutes) ---
-echo "[7/10] Deleting GKE cluster (this may take a few minutes)..."
+echo "[7/17] Deleting GKE cluster (this may take a few minutes)..."
 gcloud container clusters delete $CLUSTER_NAME --region=$REGION --quiet 2>/dev/null || echo "  (not found, skipping)"
 
 # --- GCS Buckets ---
-echo "[8/10] Deleting GCS buckets..."
+echo "[8/17] Deleting GCS buckets..."
 gsutil rm -r gs://$GCS_STAGING_BUCKET 2>/dev/null || echo "  Staging bucket not found, skipping"
 gsutil rm -r gs://$GCS_TRAINING_BUCKET 2>/dev/null || echo "  Training bucket not found, skipping"
 gsutil rm -r gs://$GCS_EVENTARC_BUCKET 2>/dev/null || echo "  Eventarc bucket not found, skipping"
 
 # --- Vertex AI Endpoint ---
-echo "[9/14] Deleting Vertex AI Endpoint (undeploys all models first)..."
+echo "[9/17] Deleting Vertex AI Endpoint (undeploys all models first)..."
 ENDPOINT_ID=$(gcloud ai endpoints list --region=$REGION --format="value(name)" --filter="displayName=gourmetgram-endpoint" --limit=1 2>/dev/null)
 if [ -n "$ENDPOINT_ID" ]; then
   # Undeploy each model individually (--all flag doesn't exist)
@@ -71,19 +71,19 @@ else
 fi
 
 # --- Vertex AI Models ---
-echo "[10/14] Deleting Vertex AI models..."
+echo "[10/17] Deleting Vertex AI models..."
 for MODEL in $(gcloud ai models list --region=$REGION --format="value(name)" --filter="displayName~gourmetgram" 2>/dev/null); do
   gcloud ai models delete $MODEL --region=$REGION --quiet 2>/dev/null || true
 done
 
 # --- Vertex AI TensorBoard ---
-echo "[11/14] Deleting Vertex AI TensorBoard instances..."
+echo "[11/17] Deleting Vertex AI TensorBoard instances..."
 for TB in $(gcloud ai tensorboards list --region=$REGION --format="value(name)" 2>/dev/null); do
   gcloud ai tensorboards delete $TB --region=$REGION --quiet 2>/dev/null || true
 done
 
 # --- Vertex AI Experiments ---
-echo "[12/14] Deleting Vertex AI Experiments..."
+echo "[12/17] Deleting Vertex AI Experiments..."
 gcloud ai experiments delete gourmetgram-experiment --region=$REGION --quiet 2>/dev/null || echo "  (not found, skipping)"
 
 # --- Artifact Registry Images ---
