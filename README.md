@@ -835,7 +835,7 @@ You can see the scheduler in the [Cloud Scheduler console](https://console.cloud
 
 ### Generate new production data
 
-Before generating new traffic, wait for the scheduler to fire once (about 5 minutes). Check the [Cloud Scheduler console](https://console.cloud.google.com/cloudscheduler) — once you see the "Last run" column update, click on `batch-data-job` in the [Cloud Run Jobs console](https://console.cloud.google.com/run/jobs) and look at the latest execution logs. You should see:
+Before generating new traffic, wait for the scheduler to fire once (about 10 minutes). Check the [Cloud Scheduler console](https://console.cloud.google.com/cloudscheduler) — once you see the "Last run" column update, click on `batch-data-job` in the [Cloud Run Jobs console](https://console.cloud.google.com/run/jobs) and look at the latest execution logs. You should see:
 
 ```
 No new images in incoming/. Skipping — no version created.
@@ -848,7 +848,7 @@ This confirms the batch job correctly skips when there's no new data — it won'
 gsutil ls gs://$GCS_TRAINING_BUCKET/datasets/Food-11/
 ```
 
-Now let's simulate more production traffic. Run the data generator against the Cloud Run inference service — this will classify new images and save them to the staging bucket:
+Now let's simulate more production traffic. Do this as soon as possible after the previous run so that this can finish before the next scheduled run is executed. Run the data generator against the Cloud Run inference service — this will classify new images and save them to the staging bucket:
 
 ```
 # run in Cloud Shell
